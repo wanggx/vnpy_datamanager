@@ -1,17 +1,24 @@
 """数据管理界面组件。"""
+import threading
+import uuid
 from collections.abc import Sequence
 from functools import partial
 from datetime import datetime, timedelta
 from typing import cast
 
+from vnpy.event import Event, EventEngine
 from vnpy.trader.ui import QtWidgets, QtCore
-from vnpy.trader.engine import MainEngine, EventEngine
+from vnpy.trader.engine import MainEngine
 from vnpy.trader.constant import Interval, Exchange
 from vnpy.trader.object import BarData
 from vnpy.trader.database import DB_TZ
 from vnpy.trader.utility import available_timezones
 
-from ..engine import APP_NAME, ManagerEngine, BarOverview, DataUniverse, DownloadMode
+from ..engine import (
+    APP_NAME, ManagerEngine, BarOverview, DataUniverse, DownloadMode,
+    EVENT_DM_DOWNLOAD_PROGRESS, DownloadProgress, DownloadTaskStatus,
+    DownloadTaskResult,
+)
 
 
 INTERVAL_NAME_MAP: dict[Interval, str] = {
@@ -597,6 +604,8 @@ class DownloadDialog(QtWidgets.QDialog):
     SCOPE_OPTIONS: list[str] = ["全部标的", "失败标的", "缺口标的"]
     # 下载模式
     MODE_OPTIONS: list[str] = ["追加", "补缺口", "重下"]
+    # 进度事件经 Qt 信号跨线程投递回 GUI 主线程（事件引擎线程 emit → 主线程槽）
+    signal_progress: QtCore.Signal = QtCore.Signal(Event)
 
     def __init__(self, engine: ManagerEngine, parent: QtWidgets.QWidget | None = None) -> None:
         """创建批量下载表单。"""
@@ -729,7 +738,13 @@ class DownloadDialog(QtWidgets.QDialog):
         )
 
     def download(self) -> None:
-        """执行批量下载（Tick 周期走 tick 接口，否则走 bar 接口）。"""
+        """执行批量下载（后台线程，进度对话框，可取消）。
+
+        Tick 周期走 tick 接口，否则走 bar 接口。下载在后台线程串行逐标的
+        调用引擎，引擎经事件引擎发 EVENT_DM_DOWNLOAD_PROGRESS，本对话框
+        用 signal_progress 把事件投递回 GUI 主线程刷新进度条；主线程只在
+        模态进度对话框上等待，不阻塞 Qt 事件循环，界面不卡。
+        """
         universe: DataUniverse = self._build_universe()
         interval: Interval = Interval(self.interval_combo.currentData())
         mode_map: dict = {
@@ -744,21 +759,143 @@ class DownloadDialog(QtWidgets.QDialog):
         start: datetime = datetime(start_date.year(), start_date.month(), start_date.day(), tzinfo=DB_TZ)
         end: datetime = datetime(end_date.year(), end_date.month(), end_date.day(), 23, 59, 59, tzinfo=DB_TZ)
 
-        if interval == Interval.TICK:
-            result = self.engine.download_universe_tick_data(
-                universe, start, end, self.output
-            )
-        else:
-            result = self.engine.download_universe_bar_data(
-                universe, interval, start, end, self.output, mode
+        # UI 生成 task_id，便于取消按钮定位任务（引擎 task_id= 参数回退到自生成）
+        task_id: str = str(uuid.uuid4())
+        self._task_id: str = task_id
+        self._last_result: DownloadTaskResult | None = None
+
+        # 订阅进度事件：事件引擎线程调 signal.emit → Qt 自动投递到主线程槽
+        event_engine: EventEngine = self.engine.event_engine
+        self.signal_progress.connect(self.process_progress_event)
+        event_engine.register(EVENT_DM_DOWNLOAD_PROGRESS, self.signal_progress.emit)
+
+        # 进度对话框（模态，主线程在 exec_ 上等信号槽，不跑下载）
+        self._progress_dialog: QtWidgets.QProgressDialog = QtWidgets.QProgressDialog(
+            "准备下载...", "取消", 0, 0, self
+        )
+        self._progress_dialog.setWindowTitle("下载历史数据")
+        self._progress_dialog.setMinimumWidth(420)
+        self._progress_dialog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        # 取消：设标志，引擎在当前标的后停止；对话框不立即关，等 CANCELLED 进度回传
+        self._progress_dialog.canceled.connect(self._cancel_download)
+        # 0..0 表示总量未知，首条进度事件到了再 setMaximum
+        self._progress_dialog.setValue(0)
+
+        # 起后台线程跑下载（daemon：进程退出不阻塞）
+        self._download_thread: threading.Thread = threading.Thread(
+            target=self._run_download,
+            args=(task_id, universe, interval, start, end, mode),
+            daemon=True,
+        )
+        self._download_thread.start()
+
+        # 阻塞等进度对话框关闭（终态时 process_progress_event 调 reset()）
+        self._progress_dialog.exec_()
+
+        # 结果汇总（沿用原 download 末尾的格式）
+        result: DownloadTaskResult | None = self._last_result
+        if result is not None:
+            QtWidgets.QMessageBox.information(
+                self, "下载结束",
+                f"标的总数：{result.total}\n成功：{result.success}\n"
+                f"失败：{result.failed}\n跳过：{result.skipped}",
+                QtWidgets.QMessageBox.StandardButton.Ok,
             )
 
-        QtWidgets.QMessageBox.information(
-            self, "下载结束",
-            f"标的总数：{result.total}\n成功：{result.success}\n"
-            f"失败：{result.failed}\n跳过：{result.skipped}",
-            QtWidgets.QMessageBox.StandardButton.Ok,
+    def _cancel_download(self) -> None:
+        """进度对话框取消按钮：请求引擎在当前标的后停止（非立即）。"""
+        self.engine.cancel_download_task(self._task_id)
+        # 提示正在取消，等 CANCELLED 进度回传后再关对话框
+        if hasattr(self, "_progress_dialog"):
+            self._progress_dialog.setLabelText("正在取消，等待当前标的完成...")
+
+    def _run_download(
+        self,
+        task_id: str,
+        universe: DataUniverse,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+        mode: DownloadMode,
+    ) -> None:
+        """后台线程：调引擎批量下载并写入 DuckDB，结果存 self._last_result。
+
+        引擎在循环里 _emit_progress 发 EVENT_DM_DOWNLOAD_PROGRESS，经事件引擎
+        → signal_progress → 主线程 process_progress_event 刷新进度。线程结束
+        后发一个终态进度事件（若引擎未发）并清理事件订阅。
+        """
+        try:
+            if interval == Interval.TICK:
+                result: DownloadTaskResult = self.engine.download_universe_tick_data(
+                    universe, start, end, self.output, task_id=task_id
+                )
+            else:
+                result = self.engine.download_universe_bar_data(
+                    universe, interval, start, end, self.output, mode, task_id=task_id
+                )
+            self._last_result = result
+        except Exception as ex:  # noqa: BLE001 - 后台线程异常不崩 GUI
+            self.output(f"下载任务异常终止：{ex}")
+            self._last_result = DownloadTaskResult(
+                task_id=task_id, universe=universe.name, interval=interval,
+                start=start, end=end, mode=mode, total=0,
+                success=0, failed=0, skipped=0,
+                failed_symbols=[], status=DownloadTaskStatus.FAILED, error=str(ex),
+            )
+            # 异常时引擎未发终态，手动发一个，让主线程关对话框
+            self.engine._emit_progress(DownloadProgress(
+                task_id=task_id, phase="异常终止", total_symbols=0,
+                completed_symbols=0, failed_symbols=0, skipped_symbols=0,
+                current_symbol="", status=DownloadTaskStatus.FAILED, error=str(ex),
+            ))
+        finally:
+            # 清理事件订阅，避免下次重复绑定
+            event_engine: EventEngine = self.engine.event_engine
+            event_engine.unregister(EVENT_DM_DOWNLOAD_PROGRESS, self.signal_progress.emit)
+
+    def process_progress_event(self, event: Event) -> None:
+        """主线程槽：据 DownloadProgress 刷新进度对话框，终态时关闭。"""
+        p: DownloadProgress = event.data
+        if not isinstance(p, DownloadProgress):
+            return
+        if not hasattr(self, "_progress_dialog"):
+            return
+
+        dialog: QtWidgets.QProgressDialog = self._progress_dialog
+        total: int = p.total_symbols
+        done: int = p.completed_symbols + p.failed_symbols + p.skipped_symbols
+
+        if total > 0:
+            dialog.setMaximum(total)
+        dialog.setValue(done)
+        dialog.setLabelText(
+            f"{p.phase}：{p.current_symbol or '—'}\n"
+            f"成功 {p.completed_symbols}  失败 {p.failed_symbols}  "
+            f"跳过 {p.skipped_symbols}  /  总数 {total}"
         )
+
+        # 终态：存结果并关闭对话框（触发 exec_ 返回）
+        if p.status in (
+            DownloadTaskStatus.COMPLETED,
+            DownloadTaskStatus.CANCELLED,
+            DownloadTaskStatus.FAILED,
+        ):
+            # 引擎未回传完整结果时，由进度字段拼一个最小结果给汇总弹框用
+            if self._last_result is None:
+                self._last_result = DownloadTaskResult(
+                    task_id=p.task_id, universe="", interval=None,
+                    start=datetime.now(DB_TZ), end=datetime.now(DB_TZ),
+                    mode=DownloadMode.APPEND, total=total,
+                    success=p.completed_symbols, failed=p.failed_symbols,
+                    skipped=p.skipped_symbols, failed_symbols=[],
+                    status=p.status, error=p.error,
+                )
+            # 断开 canceled→_cancel_download，避免 reset() 触发再次取消
+            try:
+                dialog.canceled.disconnect(self._cancel_download)
+            except (TypeError, RuntimeError):
+                pass
+            dialog.reset()
 
     def output(self, msg: str) -> None:
         """输出下载过程中的日志。"""
