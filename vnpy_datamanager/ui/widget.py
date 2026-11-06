@@ -11,7 +11,7 @@ from vnpy.trader.object import BarData
 from vnpy.trader.database import DB_TZ
 from vnpy.trader.utility import available_timezones
 
-from ..engine import APP_NAME, ManagerEngine, BarOverview
+from ..engine import APP_NAME, ManagerEngine, BarOverview, DataUniverse, DownloadMode
 
 
 INTERVAL_NAME_MAP: dict[Interval, str] = {
@@ -51,12 +51,20 @@ class ManagerWidget(QtWidgets.QWidget):
         download_button: QtWidgets.QPushButton = QtWidgets.QPushButton("下载数据")
         download_button.clicked.connect(self.download_data)
 
+        quality_button: QtWidgets.QPushButton = QtWidgets.QPushButton("检查数据")
+        quality_button.clicked.connect(self.show_quality_dialog)
+
+        schedule_button: QtWidgets.QPushButton = QtWidgets.QPushButton("定时任务")
+        schedule_button.clicked.connect(self.show_schedule_dialog)
+
         hbox1: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         hbox1.addWidget(refresh_button)
         hbox1.addStretch()
         hbox1.addWidget(import_button)
         hbox1.addWidget(update_button)
         hbox1.addWidget(download_button)
+        hbox1.addWidget(quality_button)
+        hbox1.addWidget(schedule_button)
 
         hbox2: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         hbox2.addWidget(self.tree)
@@ -405,6 +413,18 @@ class ManagerWidget(QtWidgets.QWidget):
         dialog: DownloadDialog = DownloadDialog(self.engine)
         dialog.exec_()
 
+    def show_quality_dialog(self) -> None:
+        """打开数据完整性检查对话框。"""
+        from .quality_dialog import DataQualityDialog
+        dialog: DataQualityDialog = DataQualityDialog(self.engine, self)
+        dialog.exec_()
+
+    def show_schedule_dialog(self) -> None:
+        """打开每日定时下载任务对话框。"""
+        from .schedule_dialog import ScheduledDownloadDialog
+        dialog: ScheduledDownloadDialog = ScheduledDownloadDialog(self.engine, self)
+        dialog.exec_()
+
     def show(self) -> None:
         """最大化显示窗口。"""
         self.showMaximized()
@@ -565,75 +585,182 @@ class ImportDialog(QtWidgets.QDialog):
 
 
 class DownloadDialog(QtWidgets.QDialog):
-    """下载历史数据的对话框。"""
+    """批量下载历史数据的对话框（对应阶段一原型 stage1-datamanager-vnpy-v3）。
+
+    面向数据集合/股票池批量下载，不要求用户逐个输入标的。保留原单标的下载
+    能力：数据集合选"指定标的"时显示代码输入框。
+    """
+
+    # 数据集合选项
+    UNIVERSE_OPTIONS: list[str] = ["沪深全市场", "指数成分", "自选股票池", "指定标的"]
+    # 标的范围
+    SCOPE_OPTIONS: list[str] = ["全部标的", "失败标的", "缺口标的"]
+    # 下载模式
+    MODE_OPTIONS: list[str] = ["追加", "补缺口", "重下"]
 
     def __init__(self, engine: ManagerEngine, parent: QtWidgets.QWidget | None = None) -> None:
-        """创建下载表单，开始日期默认为三年前。"""
-        super().__init__()
+        """创建批量下载表单。"""
+        super().__init__(parent)
 
         self.engine: ManagerEngine = engine
 
-        self.setWindowTitle("下载历史数据")
-        self.setFixedWidth(300)
+        self.setWindowTitle("批量下载历史数据")
+        self.setMinimumWidth(480)
 
+        # 数据集合
+        self.universe_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.universe_combo.addItems(self.UNIVERSE_OPTIONS)
+        self.universe_combo.currentTextChanged.connect(self._on_universe_changed)
+
+        # 单标的输入（仅"指定标的"时显示）
         self.symbol_edit: QtWidgets.QLineEdit = QtWidgets.QLineEdit()
-
         self.exchange_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        exchange: Exchange
         for exchange in Exchange:
             self.exchange_combo.addItem(str(exchange.name), exchange)
+        self.symbol_edit.setVisible(False)
+        self.exchange_combo.setVisible(False)
 
+        # 标的范围
+        self.scope_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.scope_combo.addItems(self.SCOPE_OPTIONS)
+
+        # 周期（按用户决策：1m/1h/1d/tick 四档）
         self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        interval: Interval
-        for interval in Interval:
+        for interval in [Interval.MINUTE, Interval.HOUR, Interval.DAILY, Interval.TICK]:
             self.interval_combo.addItem(str(interval.name), interval)
 
-        end_dt: datetime = datetime.now()
-        start_dt: datetime = end_dt - timedelta(days=3 * 365)
+        # 下载模式
+        self.mode_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.mode_combo.addItems(self.MODE_OPTIONS)
 
+        # 日期
+        end_dt: datetime = datetime.now(DB_TZ)
+        start_dt: datetime = end_dt - timedelta(days=365)
         self.start_date_edit: QtWidgets.QDateEdit = QtWidgets.QDateEdit(
-            QtCore.QDate(
-                start_dt.year,
-                start_dt.month,
-                start_dt.day
-            )
+            QtCore.QDate(start_dt.year, start_dt.month, start_dt.day)
+        )
+        self.end_date_edit: QtWidgets.QDateEdit = QtWidgets.QDateEdit(
+            QtCore.QDate(end_dt.year, end_dt.month, end_dt.day)
         )
 
-        button: QtWidgets.QPushButton = QtWidgets.QPushButton("下载")
-        button.clicked.connect(self.download)
+        # 覆盖信息提示
+        self.info_label: QtWidgets.QLabel = QtWidgets.QLabel(
+            "选择数据集合后点击\"查询覆盖\"查看标的数量与已有覆盖率。"
+        )
+        self.info_label.setWordWrap(True)
 
+        # 质量门禁提示
+        self.quality_label: QtWidgets.QLabel = QtWidgets.QLabel(
+            "数据质量门禁：覆盖率、缺失区间、重复记录、OHLC 异常。"
+            "下载完成后自动检查，失败标的可批量重试。"
+        )
+        self.quality_label.setWordWrap(True)
+
+        # 按钮
+        query_button: QtWidgets.QPushButton = QtWidgets.QPushButton("查询覆盖")
+        query_button.clicked.connect(self._query_coverage)
+        download_button: QtWidgets.QPushButton = QtWidgets.QPushButton("开始下载")
+        download_button.clicked.connect(self.download)
+        cancel_button: QtWidgets.QPushButton = QtWidgets.QPushButton("取消")
+        cancel_button.clicked.connect(self.close)
+
+        # 布局
         form: QtWidgets.QFormLayout = QtWidgets.QFormLayout()
+        form.addRow("数据集合", self.universe_combo)
         form.addRow("代码", self.symbol_edit)
         form.addRow("交易所", self.exchange_combo)
+        form.addRow("标的范围", self.scope_combo)
         form.addRow("周期", self.interval_combo)
+        form.addRow("下载模式", self.mode_combo)
         form.addRow("开始日期", self.start_date_edit)
-        form.addRow(button)
+        form.addRow("结束日期", self.end_date_edit)
+        form.addRow(self.info_label)
+        form.addRow(self.quality_label)
+
+        btn_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        btn_row.addWidget(query_button)
+        btn_row.addStretch()
+        btn_row.addWidget(download_button)
+        btn_row.addWidget(cancel_button)
+        form.addRow(btn_row)
 
         self.setLayout(form)
 
-    def download(self) -> None:
-        """Tick 周期下载 Tick，否则下载 K 线，并提示条数。"""
-        symbol: str = self.symbol_edit.text()
-        exchange: Exchange = Exchange(self.exchange_combo.currentData())
+    def _on_universe_changed(self, text: str) -> None:
+        """数据集合切换：仅"指定标的"显示代码/交易所输入。"""
+        is_single: bool = (text == "指定标的")
+        self.symbol_edit.setVisible(is_single)
+        self.exchange_combo.setVisible(is_single)
+
+    def _build_universe(self) -> DataUniverse:
+        """根据当前选择构造 DataUniverse。"""
+        name: str = self.universe_combo.currentText()
+        if name == "指定标的":
+            return DataUniverse(
+                name=name,
+                symbols=[f"{self.symbol_edit.text()}.{self.exchange_combo.currentData().value}"],
+                source="manual",
+            )
+        return DataUniverse(name=name, source="xtquant")
+
+    def _query_coverage(self) -> None:
+        """查询股票池标的数量与已有覆盖率。"""
+        universe: DataUniverse = self._build_universe()
+        if universe.source == "manual":
+            self.info_label.setText("指定标的模式：单标的下载。")
+            return
+        symbols: list = self.engine.get_universe_symbols(universe)
+        total: int = len(symbols)
+        if total == 0:
+            self.info_label.setText("未获取到标的（大 QMT 服务可能未启动）。")
+            return
+        # 统计已有覆盖
         interval: Interval = Interval(self.interval_combo.currentData())
+        overviews: list[BarOverview] = self.engine.get_bar_overview()
+        covered: int = sum(
+            1 for ov in overviews
+            if ov.interval == interval
+            and (ov.symbol, ov.exchange) in set(symbols)
+        )
+        ratio: float = covered / total * 100 if total else 0
+        self.info_label.setText(
+            f"股票池标的数：{total}，已有覆盖率：{ratio:.1f}%，"
+            f"将由数据源自动分批下载，用户不需要逐个输入或点击标的。"
+        )
+
+    def download(self) -> None:
+        """执行批量下载（Tick 周期走 tick 接口，否则走 bar 接口）。"""
+        universe: DataUniverse = self._build_universe()
+        interval: Interval = Interval(self.interval_combo.currentData())
+        mode_map: dict = {
+            "追加": DownloadMode.APPEND,
+            "补缺口": DownloadMode.REPAIR,
+            "重下": DownloadMode.REPLACE,
+        }
+        mode: DownloadMode = mode_map[self.mode_combo.currentText()]
 
         start_date: QtCore.QDate = self.start_date_edit.date()
-        start: datetime = datetime(start_date.year(), start_date.month(), start_date.day())
-        start = start.replace(tzinfo=DB_TZ)
+        end_date: QtCore.QDate = self.end_date_edit.date()
+        start: datetime = datetime(start_date.year(), start_date.month(), start_date.day(), tzinfo=DB_TZ)
+        end: datetime = datetime(end_date.year(), end_date.month(), end_date.day(), 23, 59, 59, tzinfo=DB_TZ)
 
         if interval == Interval.TICK:
-            count: int = self.engine.download_tick_data(symbol, exchange, start, self.output)
+            result = self.engine.download_universe_tick_data(
+                universe, start, end, self.output
+            )
         else:
-            count = self.engine.download_bar_data(symbol, exchange, interval, start, self.output)
+            result = self.engine.download_universe_bar_data(
+                universe, interval, start, end, self.output, mode
+            )
 
-        QtWidgets.QMessageBox.information(self, "下载结束", f"下载总数据量：{count}条", QtWidgets.QMessageBox.StandardButton.Ok)
-
-    def output(self, msg: str) -> None:
-        """输出下载过程中的日志"""
-        QtWidgets.QMessageBox.warning(
-            self,
-            "数据下载",
-            msg,
-            QtWidgets.QMessageBox.StandardButton.Ok,
+        QtWidgets.QMessageBox.information(
+            self, "下载结束",
+            f"标的总数：{result.total}\n成功：{result.success}\n"
+            f"失败：{result.failed}\n跳过：{result.skipped}",
             QtWidgets.QMessageBox.StandardButton.Ok,
         )
+
+    def output(self, msg: str) -> None:
+        """输出下载过程中的日志。"""
+        self.engine.write_log(msg, source="DataManager")
+
