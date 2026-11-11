@@ -2,6 +2,11 @@
 
 1. 修复下载数据窗口关闭按钮不可点击的问题
 2. 补充公开接口文档和类型注解，增加离线测试并在持续集成中运行
+3. 修复 `ManagerEngine` 缺少 `write_log` 导致「数据管理」下载线程被 `AttributeError`
+   打断的问题：界面、定时调度与质检对话框都用 `engine.write_log(msg, source=...)`
+   打日志，而 `BaseEngine` 并没有这个方法（只有 `MainEngine` 有），于是每条日志
+   都抛异常——真正的下载错误被掩盖成 `'ManagerEngine' object has no attribute
+   'write_log'`，下载线程直接终止。现补一个转发到 `main_engine.write_log` 的方法。
 
 # 1.2.0版本
 

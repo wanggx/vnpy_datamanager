@@ -111,6 +111,15 @@ class ManagerEngine(BaseEngine):
         self.scheduler.start()
         self.scheduler.check_and_compensate_on_start()
 
+    def write_log(self, msg: str, source: str = APP_NAME) -> None:
+        """写日志（转发到主引擎）
+
+        ``BaseEngine`` 本身没有 ``write_log``，只有 ``MainEngine`` 有；界面、
+        调度器与质检对话框都按 ``engine.write_log(msg, source=...)`` 调用，
+        缺这个方法时每打一行日志就抛 AttributeError 把下载线程带崩。
+        """
+        self.main_engine.write_log(msg, source)
+
     def stop_scheduler(self) -> None:
         """停止调度后台线程（应用关闭时调用）。"""
         self.scheduler.stop()
