@@ -1,10 +1,9 @@
 """数据完整性检查对话框（对应阶段一原型 stage1-data-quality-vnpy-v2）。
 
-独立对话框，后台任务执行检查，两层进度，总览/按交易日/按标的三视图，
-支持取消、导出报告、批量修复缺口。
+独立对话框，同步执行检查、两层进度，总览/按标的两视图，
+支持取消、导出报告、按标的或批量修复缺口。
 """
 from datetime import datetime, timedelta
-from typing import Callable
 
 from vnpy.trader.ui import QtWidgets, QtCore
 from vnpy.trader.constant import Exchange, Interval
@@ -12,8 +11,7 @@ from vnpy.trader.database import DB_TZ
 
 from ..engine import ManagerEngine, DataUniverse, DownloadMode
 from ..quality import (
-    DataQualityService, DataQualityReport, UniverseQualityReport,
-    QualityStatus, expected_minutes_for_day, trading_days_in_range,
+    DataQualityService, DataQualityReport, UniverseQualityReport, QualityStatus,
 )
 from .browser_model import SUPPORTED_INTERVALS, INTERVAL_LABELS
 
@@ -93,10 +91,9 @@ class DataQualityDialog(QtWidgets.QDialog):
         progress_row.addWidget(self.progress_bar, 2)
         progress_row.addWidget(self.cancel_button)
 
-        # 结果区：三 Tab
+        # 结果区：总览 + 按标的（按交易日视图已按需求去掉）
         self.tab: QtWidgets.QTabWidget = QtWidgets.QTabWidget()
         self.tab.addTab(self._build_overview_tab(), "总览")
-        self.tab.addTab(self._build_by_day_tab(), "按交易日")
         self.tab.addTab(self._build_by_symbol_tab(), "按标的")
 
         # 底部操作
@@ -119,30 +116,15 @@ class DataQualityDialog(QtWidgets.QDialog):
 
         self._set_busy(False)
 
-    # -- 三视图表格 -----------------------------------------------------
+    # -- 两视图表格 -----------------------------------------------------
 
     def _build_overview_tab(self) -> QtWidgets.QWidget:
-        """总览：交易日总数、完整/缺失/异常、覆盖率。"""
+        """总览：标的总数、通过/警告/失败、覆盖率。"""
         w: QtWidgets.QWidget = QtWidgets.QWidget()
         self.overview_label: QtWidgets.QLabel = QtWidgets.QLabel("尚未检查")
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         vbox.addWidget(self.overview_label)
         vbox.addStretch()
-        w.setLayout(vbox)
-        return w
-
-    def _build_by_day_tab(self) -> QtWidgets.QWidget:
-        """按交易日：交易日/期望标的数/实际标的数/缺失标的/分钟缺口/状态/操作。"""
-        w: QtWidgets.QWidget = QtWidgets.QWidget()
-        labels: list[str] = ["交易日", "期望标的数", "实际标的数", "缺失标的", "缺口根数", "状态", "操作"]
-        self.day_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget()
-        self.day_table.setColumnCount(len(labels))
-        self.day_table.setHorizontalHeaderLabels(labels)
-        self.day_table.horizontalHeader().setSectionResizeMode(
-            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
-        )
-        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
-        vbox.addWidget(self.day_table)
         w.setLayout(vbox)
         return w
 
@@ -168,7 +150,7 @@ class DataQualityDialog(QtWidgets.QDialog):
         for widget in (
             self.check_button, self.universe_combo, self.interval_combo,
             self.start_date_edit, self.end_date_edit, self.export_button,
-            self.repair_button, self.symbol_table, self.day_table,
+            self.repair_button, self.symbol_table,
         ):
             widget.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
@@ -277,36 +259,6 @@ class DataQualityDialog(QtWidgets.QDialog):
             self._fill_symbol_row(row, sr)
             self._symbol_rows[f"{sr.symbol}.{sr.exchange.value}"] = row
 
-        # 按交易日聚合（第一版按标的报告里的交易日聚合）
-        self.day_table.setRowCount(0)
-        day_map: dict[str, dict] = {}
-        for sr in report.symbol_reports:
-            if not sr.missing_ranges:
-                continue
-            for mr in sr.missing_ranges:
-                day_key: str = mr.start.strftime("%Y-%m-%d")
-                d = day_map.setdefault(day_key, {"expected": 0, "actual": 0, "missing_symbols": set(), "missing_bars": 0})
-                d["missing_symbols"].add(f"{sr.symbol}.{sr.exchange.value}")
-                d["missing_bars"] += mr.count
-        for day_key in sorted(day_map.keys()):
-            row = self.day_table.rowCount()
-            self.day_table.insertRow(row)
-            self.day_table.setItem(row, 0, QtWidgets.QTableWidgetItem(day_key))
-            self.day_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(report.total_symbols)))
-            self.day_table.setItem(row, 2, QtWidgets.QTableWidgetItem(
-                str(report.total_symbols - len(day_map[day_key]["missing_symbols"]))
-            ))
-            self.day_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(len(day_map[day_key]["missing_symbols"]))))
-            self.day_table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(day_map[day_key]["missing_bars"])))
-            status = QualityStatus.WARN if day_map[day_key]["missing_symbols"] else QualityStatus.PASS
-            si = QtWidgets.QTableWidgetItem(status.value)
-            si.setForeground(self._status_color(status))
-            self.day_table.setItem(row, 5, si)
-            missing: list[str] = sorted(day_map[day_key]["missing_symbols"])
-            self.day_table.setCellWidget(
-                row, 6, self._make_action_cell("补当日", self._repair_day, day_key, missing)
-            )
-
     def _format_missing(self, sr: DataQualityReport) -> str:
         """缺失区间描述：日线只显示日期（00:00-00:00 没有意义），分钟线带日期与时刻。"""
         parts: list[str] = []
@@ -346,16 +298,6 @@ class DataQualityDialog(QtWidgets.QDialog):
         layout.setContentsMargins(2, 0, 2, 0)
         layout.addWidget(button)
         self.symbol_table.setCellWidget(row, 5, cell)
-
-    def _make_action_cell(self, text: str, slot: Callable[..., None], *args) -> QtWidgets.QWidget:
-        """生成操作列单元格（一个按钮居中放在 QWidget 里）。"""
-        button: QtWidgets.QPushButton = QtWidgets.QPushButton(text)
-        button.clicked.connect(lambda _=False, a=args: slot(*a))
-        cell: QtWidgets.QWidget = QtWidgets.QWidget()
-        layout: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout(cell)
-        layout.setContentsMargins(2, 0, 2, 0)
-        layout.addWidget(button)
-        return cell
 
     @staticmethod
     def _status_color(status: QualityStatus) -> 'QtCore.QBrush':
@@ -403,14 +345,6 @@ class DataQualityDialog(QtWidgets.QDialog):
         vt_symbol: str = f"{sr.symbol}.{sr.exchange.value}"
         self._download_symbols("修复标的", [vt_symbol], start, end)
         self._refresh_symbol(sr)
-
-    def _repair_day(self, day_key: str, symbols: list[str]) -> None:
-        """按交易日修复：只补这一天缺失的标的，之后复算这些标的。"""
-        day: datetime = datetime.strptime(day_key, "%Y-%m-%d").replace(tzinfo=DB_TZ)
-        start: datetime = day
-        end: datetime = day.replace(hour=23, minute=59, second=59)
-        self._download_symbols(f"补 {day_key}", symbols, start, end)
-        self._recheck_symbols(symbols)
 
     def _selected_range(self) -> tuple[datetime, datetime]:
         """顶部条件栏选定的起止时间。"""
