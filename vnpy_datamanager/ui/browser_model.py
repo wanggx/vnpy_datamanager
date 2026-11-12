@@ -16,6 +16,15 @@ from vnpy.trader.constant import Exchange, Interval
 # 浏览器的周期单选：只有 1 分钟与日线（与定时下载周期一致，小时线不再使用）。
 BROWSER_INTERVALS: tuple[Interval, ...] = (Interval.DAILY, Interval.MINUTE)
 
+# 本模块所有周期选择器都只提供这两项（小时线/ Tick 不再支持）。
+SUPPORTED_INTERVALS: tuple[Interval, ...] = (Interval.MINUTE, Interval.DAILY)
+
+# 各周期的显示名（界面统一用它，避免一处写 "MINUTE" 一处写 "分钟线"）。
+INTERVAL_LABELS: dict[Interval, str] = {
+    Interval.MINUTE: "1 分钟",
+    Interval.DAILY: "日线",
+}
+
 # 默认每页行数；「加载更多」一次再加这么多。
 PAGE_SIZE: int = 100
 

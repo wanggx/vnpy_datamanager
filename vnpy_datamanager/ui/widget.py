@@ -21,14 +21,14 @@ from ..engine import (
 )
 from .browser_model import (
     BrowserRow, PAGE_SIZE, PREVIEW_ROWS, SORT_RECENT, SORT_SYMBOL,
-    BROWSER_INTERVALS, filter_rows,
+    BROWSER_INTERVALS, SUPPORTED_INTERVALS, INTERVAL_LABELS, filter_rows,
 )
 
 
 INTERVAL_NAME_MAP: dict[Interval, str] = {
-    Interval.MINUTE: "分钟线",
+    Interval.MINUTE: INTERVAL_LABELS[Interval.MINUTE],
     Interval.HOUR: "小时线",
-    Interval.DAILY: "日线",
+    Interval.DAILY: INTERVAL_LABELS[Interval.DAILY],
 }
 
 
@@ -693,9 +693,8 @@ class ImportDialog(QtWidgets.QDialog):
 
         self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         interval: Interval
-        for interval in Interval:
-            if interval != Interval.TICK:
-                self.interval_combo.addItem(str(interval.name), interval)
+        for interval in SUPPORTED_INTERVALS:
+            self.interval_combo.addItem(INTERVAL_LABELS[interval], interval)
 
         self.tz_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.tz_combo.addItems(cast(Sequence[str], available_timezones()))
@@ -798,10 +797,10 @@ class DownloadDialog(QtWidgets.QDialog):
         self.scope_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.scope_combo.addItems(self.SCOPE_OPTIONS)
 
-        # 周期（按用户决策：1m/1h/1d/tick 四档）
+        # 周期（按用户决策：只保留 1m 与日线）
         self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        for interval in [Interval.MINUTE, Interval.HOUR, Interval.DAILY, Interval.TICK]:
-            self.interval_combo.addItem(str(interval.name), interval)
+        for interval in SUPPORTED_INTERVALS:
+            self.interval_combo.addItem(INTERVAL_LABELS[interval], interval)
 
         # 下载模式
         self.mode_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
