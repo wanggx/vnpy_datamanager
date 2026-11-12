@@ -215,3 +215,53 @@ def test_check_universe_aggregates(database: DuckdbDatabase) -> None:
     assert report.pass_count == 1
     assert report.fail_count == 1
     assert "000001.SZSE" in report.failed_symbols
+
+
+def test_daily_missing_one_day_is_warn(database: DuckdbDatabase) -> None:
+    """日线缺 1 天（覆盖率 22/23 ≈ 95.7%）也必须 WARN，不能被覆盖率放过。"""
+    from datetime import date, time
+    days = trading_days_in_range(date(2026, 10, 13), date(2026, 11, 12))
+    assert len(days) == 23
+    skip = days[3]
+    bars = [
+        make_bar("000010", Exchange.SZSE,
+                 datetime.combine(d, time(0, 0), tzinfo=DB_TZ),
+                 interval=Interval.DAILY)
+        for d in days if d != skip
+    ]
+    database.save_bar_data(bars)
+
+    svc = DataQualityService(database)
+    start = datetime(2026, 10, 13, tzinfo=DB_TZ)
+    end = datetime(2026, 11, 12, 23, 59, 59, tzinfo=DB_TZ)
+    report = svc.check_bar_data("000010", Exchange.SZSE, Interval.DAILY, start, end)
+    assert (report.expected_count, report.actual_count) == (23, 22)
+    assert report.status == QualityStatus.WARN
+    assert [(mr.start.date(), mr.count) for mr in report.missing_ranges] == [(skip, 1)]
+
+
+def test_universe_problem_symbols_includes_warn(database: DuckdbDatabase) -> None:
+    """problem_symbols 要把 WARN 也算进去（批量修复靠它）。"""
+    from datetime import date, time
+    days = trading_days_in_range(date(2026, 10, 13), date(2026, 11, 12))
+    skip = days[3]
+    for symbol, exchange, drop in (
+        ("600000", Exchange.SSE, None),
+        ("000010", Exchange.SZSE, skip),
+    ):
+        database.save_bar_data([
+            make_bar(symbol, exchange, datetime.combine(d, time(0, 0), tzinfo=DB_TZ),
+                     interval=Interval.DAILY)
+            for d in days if d != drop
+        ])
+
+    svc = DataQualityService(database)
+    report = svc.check_universe_data(
+        [("600000", Exchange.SSE), ("000010", Exchange.SZSE)],
+        Interval.DAILY,
+        datetime(2026, 10, 13, tzinfo=DB_TZ),
+        datetime(2026, 11, 12, 23, 59, 59, tzinfo=DB_TZ),
+    )
+    assert (report.pass_count, report.warn_count, report.fail_count) == (1, 1, 0)
+    assert report.problem_symbols == ["000010.SZSE"]
+    assert report.failed_symbols == []

@@ -64,6 +64,10 @@ class DataQualityDialog(QtWidgets.QDialog):
         self.check_button: QtWidgets.QPushButton = QtWidgets.QPushButton("开始检查")
         self.check_button.clicked.connect(self._run_check)
 
+        self.only_problem_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("只看异常")
+        self.only_problem_check.setChecked(True)
+        self.only_problem_check.toggled.connect(self._on_only_problem_toggled)
+
         top_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         top_row.addWidget(QtWidgets.QLabel("数据集合"))
         top_row.addWidget(self.universe_combo)
@@ -73,6 +77,7 @@ class DataQualityDialog(QtWidgets.QDialog):
         top_row.addWidget(self.start_date_edit)
         top_row.addWidget(QtWidgets.QLabel("结束"))
         top_row.addWidget(self.end_date_edit)
+        top_row.addWidget(self.only_problem_check)
         top_row.addStretch()
         top_row.addWidget(self.check_button)
 
@@ -248,18 +253,25 @@ class DataQualityDialog(QtWidgets.QDialog):
         self._cancelled = True
 
     def _render_report(self, report: UniverseQualityReport) -> None:
-        """把报告渲染到三个 Tab。"""
+        """把报告渲染到三个 Tab（默认只渲染异常标的）。"""
+        only_problem: bool = self.only_problem_check.isChecked()
+        problem_count: int = report.warn_count + report.fail_count
         # 总览
         self.overview_label.setText(
             f"标的总数：{report.total_symbols}  通过：{report.pass_count}  "
             f"警告：{report.warn_count}  失败：{report.fail_count}  "
             f"总体覆盖率：{report.overall_coverage * 100:.1f}%  状态：{report.status.value}"
+            + (f"　（下表只显示 {problem_count} 个异常标的）" if only_problem else "")
         )
 
         # 按标的
+        rows: list[DataQualityReport] = [
+            sr for sr in report.symbol_reports
+            if not only_problem or sr.status != QualityStatus.PASS
+        ]
         self.symbol_table.setRowCount(0)
         self._symbol_rows = {}
-        for sr in report.symbol_reports:
+        for sr in rows:
             row: int = self.symbol_table.rowCount()
             self.symbol_table.insertRow(row)
             self._fill_symbol_row(row, sr)
@@ -295,16 +307,33 @@ class DataQualityDialog(QtWidgets.QDialog):
                 row, 6, self._make_action_cell("补当日", self._repair_day, day_key, missing)
             )
 
+    def _format_missing(self, sr: DataQualityReport) -> str:
+        """缺失区间描述：日线只显示日期（00:00-00:00 没有意义），分钟线带日期与时刻。"""
+        parts: list[str] = []
+        daily: bool = sr.interval == Interval.DAILY
+        for mr in sr.missing_ranges[:3]:
+            if daily:
+                parts.append(f"{mr.start.strftime('%Y-%m-%d')} 缺{mr.count}根")
+            elif mr.start.date() == mr.end.date():
+                parts.append(
+                    f"{mr.start.strftime('%m-%d %H:%M')}"
+                    f"-{mr.end.strftime('%H:%M')} 缺{mr.count}根"
+                )
+            else:
+                parts.append(
+                    f"{mr.start.strftime('%m-%d %H:%M')}"
+                    f"~{mr.end.strftime('%m-%d %H:%M')} 缺{mr.count}根"
+                )
+        if len(sr.missing_ranges) > 3:
+            parts.append(f"…共 {len(sr.missing_ranges)} 段")
+        return "; ".join(parts)
+
     def _fill_symbol_row(self, row: int, sr: DataQualityReport) -> None:
         """填一行按标的报告（含操作列的「修复」按钮）。"""
         self.symbol_table.setItem(row, 0, QtWidgets.QTableWidgetItem(f"{sr.symbol}.{sr.exchange.value}"))
         self.symbol_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(sr.expected_count)))
         self.symbol_table.setItem(row, 2, QtWidgets.QTableWidgetItem(str(sr.actual_count)))
-        missing_desc: str = "; ".join(
-            f"{mr.start.strftime('%H:%M')}-{mr.end.strftime('%H:%M')}({mr.count})"
-            for mr in sr.missing_ranges[:3]
-        ) + ("..." if len(sr.missing_ranges) > 3 else "")
-        self.symbol_table.setItem(row, 3, QtWidgets.QTableWidgetItem(missing_desc))
+        self.symbol_table.setItem(row, 3, QtWidgets.QTableWidgetItem(self._format_missing(sr)))
         status_item: QtWidgets.QTableWidgetItem = QtWidgets.QTableWidgetItem(sr.status.value)
         status_item.setForeground(self._status_color(sr.status))
         self.symbol_table.setItem(row, 4, status_item)
@@ -359,28 +388,29 @@ class DataQualityDialog(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(self, "导出", f"报告已导出到 {path}")
 
     def _repair_gaps(self) -> None:
-        """批量修复缺口：对失败/缺口标的重新下载。"""
-        if not self._report or not self._report.failed_symbols:
-            QtWidgets.QMessageBox.information(self, "修复", "无失败标的需修复")
+        """批量修复缺口：对警告/失败（只要有缺口）的标的重新下载。"""
+        if not self._report or not self._report.problem_symbols:
+            QtWidgets.QMessageBox.information(self, "修复", "无异常标的需修复")
             return
+        problem: list[str] = list(self._report.problem_symbols)
         start, end = self._selected_range()
-        self._download_symbols(
-            "批量修复缺口", list(self._report.failed_symbols), start, end
-        )
+        self._download_symbols("批量修复缺口", problem, start, end)
+        self._recheck_symbols(problem)
 
     def _repair_symbol(self, sr: DataQualityReport) -> None:
-        """按标的修复：只重下这一只缺口区间的数据，然后刷新该行。"""
+        """按标的修复：只重下这一只缺口区间的数据，然后复算刷新。"""
         start, end = self._selected_range()
         vt_symbol: str = f"{sr.symbol}.{sr.exchange.value}"
         self._download_symbols("修复标的", [vt_symbol], start, end)
         self._refresh_symbol(sr)
 
     def _repair_day(self, day_key: str, symbols: list[str]) -> None:
-        """按交易日修复：只补这一天缺失的标的。"""
+        """按交易日修复：只补这一天缺失的标的，之后复算这些标的。"""
         day: datetime = datetime.strptime(day_key, "%Y-%m-%d").replace(tzinfo=DB_TZ)
         start: datetime = day
         end: datetime = day.replace(hour=23, minute=59, second=59)
         self._download_symbols(f"补 {day_key}", symbols, start, end)
+        self._recheck_symbols(symbols)
 
     def _selected_range(self) -> tuple[datetime, datetime]:
         """顶部条件栏选定的起止时间。"""
@@ -422,8 +452,8 @@ class DataQualityDialog(QtWidgets.QDialog):
             f"{title}：重试 {result.total} 个标的，成功 {result.success}，仍失败 {result.failed}",
         )
 
-    def _refresh_symbol(self, sr: DataQualityReport) -> None:
-        """重算单个标的并就地刷新该行。"""
+    def _refresh_symbol(self, sr: DataQualityReport, render: bool = True) -> None:
+        """重算单个标的，更新报告与状态计数；render=False 时不立即重渲染。"""
         start, end = self._selected_range()
         interval: Interval = Interval(self.interval_combo.currentData())
         try:
@@ -433,12 +463,39 @@ class DataQualityDialog(QtWidgets.QDialog):
         except Exception as ex:
             self.engine.write_log(f"复查 {sr.symbol} 失败：{ex}", source="QualityRepair")
             return
-        row: int | None = self._symbol_rows.get(f"{sr.symbol}.{sr.exchange.value}")
-        if row is None:
+        if not self._report:
             return
-        self._fill_symbol_row(row, latest)
+        for idx, report_item in enumerate(self._report.symbol_reports):
+            if (report_item.symbol, report_item.exchange) == (sr.symbol, sr.exchange):
+                self._report.symbol_reports[idx] = latest
+                break
+        # 先减掉旧状态，再加上新状态，避免计数漂移
+        if sr.status == QualityStatus.PASS:
+            self._report.pass_count -= 1
+        elif sr.status == QualityStatus.WARN:
+            self._report.warn_count -= 1
+        else:
+            self._report.fail_count -= 1
+        if latest.status == QualityStatus.PASS:
+            self._report.pass_count += 1
+        elif latest.status == QualityStatus.WARN:
+            self._report.warn_count += 1
+        else:
+            self._report.fail_count += 1
+        if render:
+            self._render_report(self._report)
+
+    def _recheck_symbols(self, vt_symbols: list[str]) -> None:
+        """批量复算给定标的，最后只重渲染一次。"""
+        if not self._report:
+            return
+        targets: set[str] = set(vt_symbols)
+        for sr in list(self._report.symbol_reports):
+            if f"{sr.symbol}.{sr.exchange.value}" in targets:
+                self._refresh_symbol(sr, render=False)
+        self._render_report(self._report)
+
+    def _on_only_problem_toggled(self, checked: bool) -> None:
+        """切换「只看异常」时按当前报告重渲染。"""
         if self._report:
-            for idx, report_item in enumerate(self._report.symbol_reports):
-                if (report_item.symbol, report_item.exchange) == (sr.symbol, sr.exchange):
-                    self._report.symbol_reports[idx] = latest
-                    break
+            self._render_report(self._report)

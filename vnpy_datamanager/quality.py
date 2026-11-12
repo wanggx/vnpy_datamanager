@@ -97,6 +97,15 @@ class UniverseQualityReport:
             if r.status == QualityStatus.FAIL
         ]
 
+    @property
+    def problem_symbols(self) -> list[str]:
+        """非 PASS（WARN + FAIL）的标的列表，即「有缺口的」。"""
+        return [
+            f"{r.symbol}.{r.exchange.value}"
+            for r in self.symbol_reports
+            if r.status != QualityStatus.PASS
+        ]
+
 
 # ---------------------------------------------------------------------
 # 交易日历辅助
@@ -158,7 +167,6 @@ class DataQualityService:
 
     # 1m 检查：覆盖率低于此阈值标 FAIL（整标的区间）
     FAIL_COVERAGE_THRESHOLD: float = 0.5
-    WARN_COVERAGE_THRESHOLD: float = 0.95
 
     def __init__(self, database: BaseDatabase | None = None) -> None:
         self.database: BaseDatabase = database or get_database()
@@ -272,9 +280,12 @@ class DataQualityService:
             report.actual_count / report.expected_count
             if report.expected_count > 0 else 1.0
         )
+        missing: int = sum(mr.count for mr in report.missing_ranges)
         if coverage < self.FAIL_COVERAGE_THRESHOLD:
             report.status = QualityStatus.FAIL
-        elif coverage < self.WARN_COVERAGE_THRESHOLD:
+        elif missing > 0 or report.actual_count < report.expected_count \
+                or report.duplicate_count > 0 or report.volume_error_count > 0:
+            # 只要有一根缺失/重复/量额异常就算 WARN，不再用 95% 覆盖率把小缺口放过
             report.status = QualityStatus.WARN
         else:
             report.status = QualityStatus.PASS
@@ -426,7 +437,7 @@ class DataQualityService:
         # 总体状态：任一 FAIL 且覆盖率低则 FAIL，否则按覆盖率
         if report.fail_count > 0 and report.overall_coverage < self.FAIL_COVERAGE_THRESHOLD:
             report.status = QualityStatus.FAIL
-        elif report.warn_count > 0 or report.overall_coverage < self.WARN_COVERAGE_THRESHOLD:
+        elif report.warn_count > 0 or report.overall_coverage < 1.0:
             report.status = QualityStatus.WARN
         else:
             report.status = QualityStatus.PASS
