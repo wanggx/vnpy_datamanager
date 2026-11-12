@@ -19,6 +19,10 @@ from ..engine import (
     EVENT_DM_DOWNLOAD_PROGRESS, DownloadProgress, DownloadTaskStatus,
     DownloadTaskResult,
 )
+from .browser_model import (
+    BrowserRow, PAGE_SIZE, PREVIEW_ROWS, SORT_RECENT, SORT_SYMBOL,
+    BROWSER_INTERVALS, filter_rows,
+)
 
 
 INTERVAL_NAME_MAP: dict[Interval, str] = {
@@ -43,7 +47,6 @@ class ManagerWidget(QtWidgets.QWidget):
         """搭建数据树、K 线表和刷新、导入、更新、下载按钮。"""
         self.setWindowTitle("数据管理")
 
-        self.init_tree()
         self.init_table()
 
         refresh_button: QtWidgets.QPushButton = QtWidgets.QPushButton("刷新")
@@ -73,9 +76,19 @@ class ManagerWidget(QtWidgets.QWidget):
         hbox1.addWidget(quality_button)
         hbox1.addWidget(schedule_button)
 
+        left_panel: QtWidgets.QWidget = self.init_browser()
+
+        self.table_label: QtWidgets.QLabel = QtWidgets.QLabel("未选择标的")
+        self.table_label.setStyleSheet("color: #5b6673; padding: 2px 4px;")
+
+        right_box: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        right_box.setContentsMargins(0, 0, 0, 0)
+        right_box.addWidget(self.table_label)
+        right_box.addWidget(self.table)
+
         hbox2: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
-        hbox2.addWidget(self.tree)
-        hbox2.addWidget(self.table)
+        hbox2.addWidget(left_panel)
+        hbox2.addLayout(right_box, 1)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         vbox.addLayout(hbox1)
@@ -83,24 +96,254 @@ class ManagerWidget(QtWidgets.QWidget):
 
         self.setLayout(vbox)
 
-    def init_tree(self) -> None:
-        """创建数据概况树及其表头。"""
-        labels: list = [
-            "数据",
-            "本地代码",
-            "代码",
-            "交易所",
-            "数据量",
-            "开始时间",
-            "结束时间",
-            "",
-            "",
-            ""
-        ]
+    def init_browser(self) -> QtWidgets.QWidget:
+        """左侧数据浏览器：搜索 + 周期单选 + 交易所筛选 + 列表（只渲染前 N 行）。
 
-        self.tree: QtWidgets.QTreeWidget = QtWidgets.QTreeWidget()
-        self.tree.setColumnCount(len(labels))
-        self.tree.setHeaderLabels(labels)
+        全库 5000+ 个标的，全量建表（每行三个按钮，约 1.5 万个控件）既慢又看不过来，
+        所以这里只渲染 ``PAGE_SIZE`` 行，「加载更多」按页追加；搜索与筛选在内存里
+        对完整概览做，跨全库生效，不受已渲染行数限制。
+        """
+        self.search_edit: QtWidgets.QLineEdit = QtWidgets.QLineEdit()
+        self.search_edit.setPlaceholderText("输入代码 / 名称搜索，如 600000、浦发、600000.SSE")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._on_filter_changed)
+
+        self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for interval in BROWSER_INTERVALS:
+            self.interval_combo.addItem(INTERVAL_NAME_MAP[interval], interval)
+        self.interval_combo.currentIndexChanged.connect(self._on_filter_changed)
+
+        self.exchange_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.exchange_combo.addItem("交易所：全部", None)
+        self.exchange_combo.currentIndexChanged.connect(self._on_filter_changed)
+
+        self.sort_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.sort_combo.addItem("排序：最近更新", SORT_RECENT)
+        self.sort_combo.addItem("排序：代码", SORT_SYMBOL)
+        self.sort_combo.currentIndexChanged.connect(self._on_filter_changed)
+
+        self.browser_info_label: QtWidgets.QLabel = QtWidgets.QLabel("")
+        self.browser_info_label.setStyleSheet("color: #64707d; padding: 0 2px;")
+
+        search_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        search_row.setSpacing(6)
+        search_row.addWidget(self.search_edit, 1)
+        search_row.addWidget(self.interval_combo)
+        search_row.addWidget(self.exchange_combo)
+        search_row.addWidget(self.sort_combo)
+
+        labels: list = ["代码", "名称", "周期", "交易所", "根数", "起始", "结束", "操作"]
+
+        self.browser_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget()
+        self.browser_table.setColumnCount(len(labels))
+        self.browser_table.setHorizontalHeaderLabels(labels)
+        self.browser_table.verticalHeader().setVisible(False)
+        self.browser_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.browser_table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.browser_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+
+        self.browser_status_label: QtWidgets.QLabel = QtWidgets.QLabel("")
+        self.browser_status_label.setStyleSheet("color: #64707d;")
+
+        self.more_button: QtWidgets.QPushButton = QtWidgets.QPushButton(
+            f"加载更多 {PAGE_SIZE} 条"
+        )
+        self.more_button.clicked.connect(self._load_more)
+        self.more_button.setEnabled(False)
+
+        foot_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        foot_row.setSpacing(6)
+        foot_row.addWidget(self.browser_status_label)
+        foot_row.addStretch()
+        foot_row.addWidget(self.more_button)
+
+        box: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+        box.addLayout(search_row)
+        box.addWidget(self.browser_info_label)
+        box.addWidget(self.browser_table, 1)
+        box.addLayout(foot_row)
+
+        panel: QtWidgets.QWidget = QtWidgets.QWidget()
+        panel.setLayout(box)
+        panel.setMinimumWidth(720)
+
+        # 浏览状态：概览缓存、已渲染页大小、合约名称缓存
+        self._browser_rows: list[BrowserRow] = []
+        self._browser_totals: dict[Interval, int] = {}
+        self._display_limit: int = PAGE_SIZE
+        self._name_cache: dict[str, str] = {}
+
+        return panel
+
+    def _on_filter_changed(self, *args: object) -> None:
+        """搜索词/周期/交易所/排序变化：回到第一页重新渲染。"""
+        self._display_limit = PAGE_SIZE
+        self._render_rows()
+
+    def _load_more(self) -> None:
+        """加载更多：再放一页。"""
+        self._display_limit += PAGE_SIZE
+        self._render_rows()
+
+    def refresh_tree(self) -> None:
+        """重新读取数据库概览，刷新筛选下拉并回到第一页。
+
+        概览是一次全量查询（5000+ 行，毫秒级），真正的开销在渲染，所以这里只缓存
+        数据、只渲染 ``PAGE_SIZE`` 行。
+        """
+        overviews: list[BarOverview] = self.engine.get_bar_overview()
+
+        rows: list[BrowserRow] = []
+        totals: dict[Interval, int] = {}
+        exchanges: set[Exchange] = set()
+
+        overview: BarOverview
+        for overview in overviews:
+            interval: Interval = cast(Interval, overview.interval)
+            exchange: Exchange = cast(Exchange, overview.exchange)
+
+            totals[interval] = totals.get(interval, 0) + 1
+            exchanges.add(exchange)
+            rows.append(
+                BrowserRow(
+                    symbol=overview.symbol,
+                    exchange=exchange,
+                    interval=interval,
+                    name=self._contract_name(overview.symbol, exchange),
+                    count=int(overview.count),
+                    start=cast(datetime, overview.start),
+                    end=cast(datetime, overview.end),
+                )
+            )
+
+        self._browser_rows = rows
+        self._browser_totals = totals
+        self._rebuild_exchange_options(exchanges)
+        self._display_limit = PAGE_SIZE
+        self._render_rows()
+
+    def _rebuild_exchange_options(self, exchanges: set[Exchange]) -> None:
+        """按库里实际存在的交易所重建下拉项（保留当前选择）。"""
+        current: Exchange | None = self.exchange_combo.currentData()
+        self.exchange_combo.blockSignals(True)
+        try:
+            self.exchange_combo.clear()
+            self.exchange_combo.addItem("交易所：全部", None)
+            for exchange in sorted(exchanges, key=lambda item: item.value):
+                self.exchange_combo.addItem(exchange.value, exchange)
+            index: int = self.exchange_combo.findData(current) if current else 0
+            self.exchange_combo.setCurrentIndex(max(0, index))
+        finally:
+            self.exchange_combo.blockSignals(False)
+
+    def _contract_name(self, symbol: str, exchange: Exchange) -> str:
+        """合约名称（来自主引擎合约缓存；取不到就留空，界面显示 ``-``）。"""
+        vt_symbol: str = f"{symbol}.{exchange.value}"
+        if vt_symbol in self._name_cache:
+            return self._name_cache[vt_symbol]
+
+        name: str = ""
+        try:
+            contract = self.engine.main_engine.get_contract(vt_symbol)
+            name = getattr(contract, "name", "") or ""
+        except Exception:  # noqa: BLE001 - 名称只是展示，取不到不影响浏览
+            name = ""
+        self._name_cache[vt_symbol] = name
+        return name
+
+    def _render_rows(self) -> None:
+        """按当前筛选条件渲染前 ``_display_limit`` 行，并更新计数提示。"""
+        interval: Interval = cast(
+            Interval, self.interval_combo.currentData() or Interval.DAILY
+        )
+        exchange: Exchange | None = self.exchange_combo.currentData()
+        keyword: str = self.search_edit.text()
+        sort: str = str(self.sort_combo.currentData() or SORT_RECENT)
+
+        matched: list[BrowserRow] = filter_rows(
+            self._browser_rows,
+            interval,
+            exchange=exchange,
+            keyword=keyword,
+            sort=sort,
+        )
+        shown: list[BrowserRow] = matched[: self._display_limit]
+
+        self.browser_table.setRowCount(0)
+        self.browser_table.setRowCount(len(shown))
+        for index, row in enumerate(shown):
+            self._fill_browser_row(index, row)
+
+        interval_name: str = INTERVAL_NAME_MAP.get(interval, interval.value)
+        total: int = self._browser_totals.get(interval, 0)
+        if not total:
+            self.browser_info_label.setText(f"{interval_name} · 数据库里还没有该周期的数据")
+        elif not matched:
+            self.browser_info_label.setText(
+                f"{interval_name} · 共 {total} 个标的 · 没有匹配的标的，换个代码或名称试试"
+            )
+        else:
+            self.browser_info_label.setText(
+                f"{interval_name} · 共 {total} 个标的 · 匹配 {len(matched)} 个 · "
+                f"显示前 {len(shown)} 个"
+            )
+
+        self.browser_status_label.setText(
+            f"已显示 {len(shown)} / 匹配 {len(matched)}（该周期共 {total}）"
+        )
+        self.more_button.setEnabled(len(shown) < len(matched))
+
+    def _fill_browser_row(self, row_index: int, row: BrowserRow) -> None:
+        """填充一行：文本列 + 操作列（查看/导出/删除）。"""
+        values: list[str] = [
+            row.vt_symbol,
+            row.name or "-",
+            INTERVAL_NAME_MAP.get(row.interval, row.interval.value),
+            row.exchange.value,
+            str(row.count),
+            row.start.strftime("%Y-%m-%d %H:%M"),
+            row.end.strftime("%Y-%m-%d %H:%M"),
+        ]
+        for column, text in enumerate(values):
+            cell: DataCell = DataCell(text)
+            if column >= 4:
+                cell.setTextAlignment(
+                    QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+                )
+            self.browser_table.setItem(row_index, column, cell)
+
+        show_button: QtWidgets.QPushButton = QtWidgets.QPushButton("查看")
+        show_button.clicked.connect(partial(
+            self.show_data, row.symbol, row.exchange, row.interval, row.start, row.end
+        ))
+        output_button: QtWidgets.QPushButton = QtWidgets.QPushButton("导出")
+        output_button.clicked.connect(partial(
+            self.output_data, row.symbol, row.exchange, row.interval, row.start, row.end
+        ))
+        delete_button: QtWidgets.QPushButton = QtWidgets.QPushButton("删除")
+        delete_button.clicked.connect(partial(
+            self.delete_data, row.symbol, row.exchange, row.interval
+        ))
+
+        buttons: QtWidgets.QWidget = QtWidgets.QWidget()
+        button_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        button_row.setContentsMargins(2, 0, 2, 0)
+        button_row.setSpacing(4)
+        for button in (show_button, output_button, delete_button):
+            button.setMaximumWidth(56)
+            button_row.addWidget(button)
+        button_row.addStretch()
+        buttons.setLayout(button_row)
+        self.browser_table.setCellWidget(row_index, 7, buttons)
+
 
     def init_table(self) -> None:
         """创建 K 线表格，列宽按内容调整。"""
@@ -122,98 +365,6 @@ class ManagerWidget(QtWidgets.QWidget):
         self.table.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeMode.ResizeToContents
         )
-
-    def refresh_tree(self) -> None:
-        """清空概况树，并按周期、交易所和合约重新挂上数据节点。"""
-        self.tree.clear()
-
-        # 初始化节点缓存字典
-        interval_childs: dict[Interval, QtWidgets.QTreeWidgetItem] = {}
-        exchange_childs: dict[tuple[Interval, Exchange], QtWidgets.QTreeWidgetItem] = {}
-
-        # 查询数据汇总，并基于合约代码进行排序
-        overviews: list[BarOverview] = self.engine.get_bar_overview()
-        overviews.sort(key=lambda x: x.symbol)
-
-        # 添加数据周期节点
-        interval: Interval
-        for interval in [Interval.MINUTE, Interval.HOUR, Interval.DAILY]:
-            interval_child: QtWidgets.QTreeWidgetItem = QtWidgets.QTreeWidgetItem()
-            interval_childs[interval] = interval_child
-
-            interval_name: str = INTERVAL_NAME_MAP[interval]
-            interval_child.setText(0, interval_name)
-
-        # 遍历添加数据节点
-        overview: BarOverview
-        for overview in overviews:
-            interval = cast(Interval, overview.interval)
-            exchange: Exchange = cast(Exchange, overview.exchange)
-            start: datetime = cast(datetime, overview.start)
-            end: datetime = cast(datetime, overview.end)
-
-            # 获取交易所节点
-            key: tuple[Interval, Exchange] = (interval, exchange)
-            exchange_child: QtWidgets.QTreeWidgetItem | None = exchange_childs.get(key)
-
-            if not exchange_child:
-                interval_child = interval_childs[interval]
-
-                exchange_child = QtWidgets.QTreeWidgetItem(interval_child)
-                exchange_child.setText(0, exchange.value)
-
-                exchange_childs[key] = exchange_child
-
-            #  创建数据节点
-            item: QtWidgets.QTreeWidgetItem = QtWidgets.QTreeWidgetItem(exchange_child)
-
-            item.setText(1, f"{overview.symbol}.{exchange.value}")
-            item.setText(2, overview.symbol)
-            item.setText(3, exchange.value)
-            item.setText(4, str(overview.count))
-            item.setText(5, start.strftime("%Y-%m-%d %H:%M:%S"))
-            item.setText(6, end.strftime("%Y-%m-%d %H:%M:%S"))
-
-            output_button: QtWidgets.QPushButton = QtWidgets.QPushButton("导出")
-            output_func: partial[None] = partial(
-                self.output_data,
-                overview.symbol,
-                exchange,
-                interval,
-                start,
-                end
-            )
-            output_button.clicked.connect(output_func)
-
-            show_button: QtWidgets.QPushButton = QtWidgets.QPushButton("查看")
-            show_func: partial[None] = partial(
-                self.show_data,
-                overview.symbol,
-                exchange,
-                interval,
-                start,
-                end
-            )
-            show_button.clicked.connect(show_func)
-
-            delete_button: QtWidgets.QPushButton = QtWidgets.QPushButton("删除")
-            delete_func: partial[None] = partial(
-                self.delete_data,
-                overview.symbol,
-                exchange,
-                interval
-            )
-            delete_button.clicked.connect(delete_func)
-
-            self.tree.setItemWidget(item, 7, show_button)
-            self.tree.setItemWidget(item, 8, output_button)
-            self.tree.setItemWidget(item, 9, delete_button)
-
-        # 展开顶层节点
-        self.tree.addTopLevelItems(list(interval_childs.values()))
-
-        for interval_child in interval_childs.values():
-            interval_child.setExpanded(True)
 
     def import_data(self) -> None:
         """确认 CSV 导入参数后写入数据库并提示起止时间与条数，取消对话框则返回。"""
@@ -335,20 +486,34 @@ class ManagerWidget(QtWidgets.QWidget):
             end
         )
 
+        total: int = len(bars)
+        preview: list[BarData] = bars[-PREVIEW_ROWS:] if total > PREVIEW_ROWS else bars
+        truncated: bool = total > len(preview)
+
+        interval_name: str = INTERVAL_NAME_MAP.get(interval, interval.value)
+        title: str = (
+            f"{symbol}.{exchange.value} · {interval_name} · "
+            f"{start.strftime('%Y-%m-%d %H:%M')} ~ {end.strftime('%Y-%m-%d %H:%M')} · "
+            f"共 {total} 根"
+        )
+        if truncated:
+            title += f" · 预览最近 {len(preview)} 根（导出可取全量）"
+        self.table_label.setText(title)
+
         self.table.setRowCount(0)
-        self.table.setRowCount(len(bars))
+        self.table.setRowCount(len(preview))
 
         row: int
         bar: BarData
-        for row, bar in enumerate(bars):
+        for row, bar in enumerate(preview):
             self.table.setItem(row, 0, DataCell(bar.datetime.strftime("%Y-%m-%d %H:%M:%S")))
-            self.table.setItem(row, 1, DataCell(str(bar.open_price)))
-            self.table.setItem(row, 2, DataCell(str(bar.high_price)))
-            self.table.setItem(row, 3, DataCell(str(bar.low_price)))
-            self.table.setItem(row, 4, DataCell(str(bar.close_price)))
-            self.table.setItem(row, 5, DataCell(str(bar.volume)))
-            self.table.setItem(row, 6, DataCell(str(bar.turnover)))
-            self.table.setItem(row, 7, DataCell(str(bar.open_interest)))
+            self.table.setItem(row, 1, DataCell(f"{bar.open_price:.2f}"))
+            self.table.setItem(row, 2, DataCell(f"{bar.high_price:.2f}"))
+            self.table.setItem(row, 3, DataCell(f"{bar.low_price:.2f}"))
+            self.table.setItem(row, 4, DataCell(f"{bar.close_price:.2f}"))
+            self.table.setItem(row, 5, DataCell(f"{bar.volume:.2f}"))
+            self.table.setItem(row, 6, DataCell(f"{bar.turnover:.2f}"))
+            self.table.setItem(row, 7, DataCell(f"{bar.open_interest:.2f}"))
 
     def delete_data(
         self,
