@@ -1,16 +1,18 @@
 """数据质量检查服务。
 
 阶段一核心功能：对 DuckDB 中的 Bar/Tick 数据按交易日历和交易时段做连续性、
-重复、OHLC、成交量等结构化检查，输出 PASS/WARN/FAIL 报告。报告写入同一
-vnpy.duckdb 文件的 quality 逻辑表（与插件行情表物理同库、逻辑分离）。
+重复、OHLC、成交量等结构化检查，输出 PASS/FAIL 报告。本地发现缺口时会向
+数据源（大 QMT）复核这些时间点：源头同样没有（停牌、无成交等）算正常缺口，
+源头有而本地没有才是 FAIL。报告写入同一 vnpy.duckdb 文件的 quality 逻辑表
+（与插件行情表物理同库、逻辑分离）。
 
 本模块是阶段三情绪计算的前置门禁：情绪历史构建必须先调用
-DataQualityService.check_bar_data，按 PASS/WARN/FAIL 决定是否允许计算。
+DataQualityService.check_bar_data，按 PASS/FAIL 决定是否允许计算。
 """
 from datetime import datetime, date, time, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.database import BaseDatabase, get_database, DB_TZ
@@ -31,10 +33,9 @@ A_SHARE_EXCHANGES: tuple[Exchange, ...] = (Exchange.SSE, Exchange.SZSE, Exchange
 
 
 class QualityStatus(Enum):
-    """质量检查结果状态。"""
-    PASS = "PASS"      # 该日所有关键标的和周期数据完整
-    WARN = "WARN"      # 有少量缺失，但达到允许覆盖率
-    FAIL = "FAIL"      # 整日缺失或关键标的缺失
+    """质量检查结果状态（只有两态）。"""
+    PASS = "PASS"      # 本地完整，或缺失时间点在数据源同样不存在（正常缺口）
+    FAIL = "FAIL"      # 数据源有数据但本地没有，或存在结构性错误
 
 
 @dataclass
@@ -62,6 +63,12 @@ class DataQualityReport:
     ohlc_error_count: int = 0        # OHLC 关系错误数
     volume_error_count: int = 0       # 成交量/成交额异常数
 
+    # 缺口复核：本地按日历算出的缺失点，向数据源再查一遍
+    missing_count: int = 0            # 本地缺失点数（含正常缺口）
+    remote_gap_count: int = 0         # 数据源有、本地没有（真洞）
+    source_missing_count: int = 0     # 数据源同样没有（正常缺口）
+    remote_checked: bool = False      # 是否完成了数据源复核
+
     status: QualityStatus = QualityStatus.PASS
     error: str = ""
 
@@ -81,7 +88,6 @@ class UniverseQualityReport:
 
     total_symbols: int = 0
     pass_count: int = 0
-    warn_count: int = 0
     fail_count: int = 0
     overall_coverage: float = 0.0     # 总体覆盖率 actual/expected
 
@@ -97,32 +103,24 @@ class UniverseQualityReport:
             if r.status == QualityStatus.FAIL
         ]
 
-    @property
-    def problem_symbols(self) -> list[str]:
-        """非 PASS（WARN + FAIL）的标的列表，即「有缺口的」。"""
-        return [
-            f"{r.symbol}.{r.exchange.value}"
-            for r in self.symbol_reports
-            if r.status != QualityStatus.PASS
-        ]
-
 
 # ---------------------------------------------------------------------
 # 交易日历辅助
 # ---------------------------------------------------------------------
 
 def is_trading_day(d: date) -> bool:
-    """粗略判断是否为交易日（排除周末）。
+    """粗略判断是否为交易日（只排除周末）。
 
-    精确的节假日判断需交易日历；第一版仅排除周末，停牌/半日市/节假日由
-    数据缺失规则与覆盖率阈值容忍。后续可接入 xtdata.get_trading_dates
-    或本地交易日历表。
+    这只是**回退**用的粗日历：精确判断（含节假日休市）请由调用方通过
+    `ManagerEngine.get_trading_dates()`（大 QMT `get_trading_dates`）取回后，
+    以 `trading_days=` 传给 `check_bar_data`。否则节假日的正常工作日会被当成
+    缺口，进而对全市场触发无谓的回源拉数。
     """
     return d.weekday() < 5
 
 
 def trading_days_in_range(start: date, end: date) -> list[date]:
-    """返回 [start, end] 区间内的交易日（排除周末）。"""
+    """返回 [start, end] 区间内的交易日（只排除周末，未取精确日历时使用）。"""
     days: list[date] = []
     cur: date = start
     while cur <= end:
@@ -157,16 +155,22 @@ def expected_minutes_for_day(d: date) -> list[time]:
 # DataQualityService
 # ---------------------------------------------------------------------
 
+# 缺口复核回调：把整段检查周期重新向数据源取一次，返回源头真实存在的时间点；
+# 返回 None 表示无法复核（数据源未就绪等）。
+BarProbe = Callable[
+    [str, Exchange, Interval, datetime, datetime], set[datetime] | None
+]
+
+
 class DataQualityService:
     """数据质量检查服务。
 
     通过 get_database() 拿到的数据库实例读取 Bar/Tick，按交易日历和交易时段
-    做结构化检查。报告写入同一 DuckDB 文件的 quality.data_quality_report
-    与 quality.data_gap 表（若数据库实例暴露连接则建表；否则报告仅在内存返回）。
+    做结构化检查。发现缺口时用 BarProbe 把整段周期回源重取一次比对：源头同样
+    没有的洞算正常，源头有而本地没有才判 FAIL。报告写入同一 DuckDB 文件的
+    quality.data_quality_report 与 quality.data_gap 表（若数据库实例暴露连接
+    则建表；否则报告仅在内存返回）。
     """
-
-    # 1m 检查：覆盖率低于此阈值标 FAIL（整标的区间）
-    FAIL_COVERAGE_THRESHOLD: float = 0.5
 
     def __init__(self, database: BaseDatabase | None = None) -> None:
         self.database: BaseDatabase = database or get_database()
@@ -180,11 +184,22 @@ class DataQualityService:
         interval: Interval,
         start: datetime,
         end: datetime,
+        probe: BarProbe | None = None,
+        trading_days: list[date] | None = None,
     ) -> DataQualityReport:
-        """检查单标的单周期在 [start, end] 区间的数据质量。"""
+        """检查单标的单周期在 [start, end] 区间的数据质量。
+
+        probe 用于回源复核缺口（见 BarProbe）；不传时只要有缺口就判 FAIL。
+        trading_days 是 QMT 给的精确交易日历（含节假日剔除）；不传时退化为
+        只排除周末的粗日历，节假日的正常工作日在粗日历里会被误判成缺口。
+        """
         report: DataQualityReport = DataQualityReport(
             symbol=symbol, exchange=exchange, interval=interval,
             start=start, end=end, source="duckdb",
+        )
+        days: list[date] = (
+            trading_days if trading_days is not None
+            else trading_days_in_range(start.date(), end.date())
         )
 
         # 读取实际数据
@@ -194,15 +209,18 @@ class DataQualityService:
         report.actual_count = len(bars)
 
         if not bars:
-            report.status = QualityStatus.FAIL
-            report.error = "无数据"
+            # 完全没数据也要回源确认：源头也没有才可能是正常（未上市/长期停牌）
+            report.expected_count = self._expected_count(interval, start, end, days)
+            self._check_gaps(report, interval, start, end, {}, probe, days)
             self._classify_status(report)
             return report
 
         # 期望根数
         report.expected_count = self._expected_count(
-            interval, start.astimezone(DB_TZ) if start.tzinfo else start,
+            interval,
+            start.astimezone(DB_TZ) if start.tzinfo else start,
             end.astimezone(DB_TZ) if end.tzinfo else end,
+            days,
         )
 
         # 重复时间戳
@@ -219,29 +237,8 @@ class DataQualityService:
         # 时间点集合（带日期）
         bar_times: dict[datetime, Any] = {b.datetime: b for b in bars}
 
-        # 缺失 + 非交易时段
-        missing_count: int = 0
-        if interval == Interval.MINUTE:
-            missing_ranges, outside = self._check_minute_continuity(
-                symbol, exchange, start, end, bar_times
-            )
-            report.missing_ranges = missing_ranges
-            report.outside_session_count = outside
-            missing_count = sum(mr.count for mr in missing_ranges)
-        elif interval == Interval.HOUR:
-            missing_ranges, outside = self._check_hour_continuity(
-                symbol, exchange, start, end, bar_times
-            )
-            report.missing_ranges = missing_ranges
-            report.outside_session_count = outside
-            missing_count = sum(mr.count for mr in missing_ranges)
-        else:
-            # 日线：检查交易日缺失
-            missing_ranges = self._check_daily_continuity(
-                symbol, exchange, start, end, bar_times
-            )
-            report.missing_ranges = missing_ranges
-            missing_count = sum(mr.count for mr in missing_ranges)
+        # 缺失 + 非交易时段 + 回源复核
+        self._check_gaps(report, interval, start, end, bar_times, probe, days)
 
         # OHLC 与成交量异常
         ohlc_err: int = 0
@@ -265,38 +262,112 @@ class DataQualityService:
         self._classify_status(report)
         return report
 
-    def _classify_status(self, report: DataQualityReport) -> None:
-        """根据各项指标判定 PASS/WARN/FAIL。"""
-        if report.actual_count == 0:
-            report.status = QualityStatus.FAIL
-            return
+    def _check_gaps(
+        self,
+        report: DataQualityReport,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+        bar_times: dict[datetime, Any],
+        probe: BarProbe | None,
+        days: list[date],
+    ) -> None:
+        """算缺口区间、向数据源复核缺口，并把结果写进报告。
 
-        # OHLC 错误或重复过多直接 FAIL
-        if report.ohlc_error_count > 0:
-            report.status = QualityStatus.FAIL
-            return
-
-        coverage: float = (
-            report.actual_count / report.expected_count
-            if report.expected_count > 0 else 1.0
-        )
-        missing: int = sum(mr.count for mr in report.missing_ranges)
-        if coverage < self.FAIL_COVERAGE_THRESHOLD:
-            report.status = QualityStatus.FAIL
-        elif missing > 0 or report.actual_count < report.expected_count \
-                or report.duplicate_count > 0 or report.volume_error_count > 0:
-            # 只要有一根缺失/重复/量额异常就算 WARN，不再用 95% 覆盖率把小缺口放过
-            report.status = QualityStatus.WARN
+        只有确实算出缺口（missing_ranges 非空）才会调用 probe 回源拉数。
+        """
+        missing_points: list[datetime] = []
+        if interval == Interval.MINUTE:
+            report.missing_ranges, report.outside_session_count = \
+                self._check_minute_continuity(
+                    report.symbol, report.exchange, start, end, bar_times, days
+                )
+            missing_points = self._expected_points(
+                interval, start, end, bar_times, days
+            )
+        elif interval == Interval.HOUR:
+            report.missing_ranges, report.outside_session_count = \
+                self._check_hour_continuity(
+                    report.symbol, report.exchange, start, end, bar_times, days
+                )
         else:
-            report.status = QualityStatus.PASS
+            report.missing_ranges = self._check_daily_continuity(
+                report.symbol, report.exchange, start, end, bar_times, days
+            )
+            missing_points = self._expected_points(
+                interval, start, end, bar_times, days
+            )
+
+        report.missing_count = sum(mr.count for mr in report.missing_ranges)
+
+        # 回源复核（整段重取）：源头也没有的洞是正常的（停牌/无成交），
+        # 源头有而本地没有才是真洞。
+        if not report.missing_ranges:
+            return
+        if probe is None:
+            report.remote_gap_count = report.missing_count
+            report.error = "缺口未经数据源复核"
+            return
+        if not missing_points:
+            report.remote_gap_count = report.missing_count
+            report.error = "该周期暂不支持回源复核"
+            return
+        available: set[datetime] | None = probe(
+            report.symbol, report.exchange, interval, start, end
+        )
+        if available is None:
+            report.remote_gap_count = report.missing_count
+            report.error = "数据源复核失败"
+            return
+        report.remote_checked = True
+        report.remote_gap_count = sum(1 for dt in missing_points if dt in available)
+        report.source_missing_count = report.missing_count - report.remote_gap_count
+        if report.remote_gap_count:
+            report.error = f"数据源有 {report.remote_gap_count} 根本地缺失"
+
+    def _expected_points(
+        self,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+        bar_times: dict[datetime, Any],
+        days: list[date],
+    ) -> list[datetime]:
+        """按交易日历列出本地缺失的时间点（用于回源复核）。"""
+        points: list[datetime] = []
+        for d in days:
+            if interval == Interval.DAILY:
+                dt: datetime = datetime.combine(d, time(0, 0), tzinfo=DB_TZ)
+                if start <= dt <= end and dt not in bar_times:
+                    points.append(dt)
+                continue
+            for t in expected_minutes_for_day(d):
+                dt = datetime.combine(d, t).replace(tzinfo=DB_TZ)
+                if start <= dt <= end and dt not in bar_times:
+                    points.append(dt)
+        return points
+
+    def _classify_status(self, report: DataQualityReport) -> None:
+        """只有两态：缺口经数据源复核为正常才算 PASS，否则 FAIL。"""
+        if report.ohlc_error_count > 0 or report.volume_error_count > 0:
+            report.status = QualityStatus.FAIL
+            return
+        if report.remote_gap_count > 0:
+            report.status = QualityStatus.FAIL
+            return
+        report.status = QualityStatus.PASS
 
     def _expected_count(
-        self, interval: Interval, start: datetime, end: datetime
+        self,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+        days: list[date],
     ) -> int:
         """计算 [start, end] 区间的期望根数。"""
         if interval == Interval.MINUTE:
             count: int = 0
-            for d in trading_days_in_range(start.date(), end.date()):
+            for d in days:
                 # 该日期望 240 根，但起止日按时间截断
                 day_times = expected_minutes_for_day(d)
                 for t in day_times:
@@ -307,14 +378,14 @@ class DataQualityService:
         elif interval == Interval.HOUR:
             # 每个交易日 4 根小时线（10:30, 11:30, 14:00, 15:00 大致）
             count = 0
-            for d in trading_days_in_range(start.date(), end.date()):
+            for d in days:
                 for h in (10, 11, 14, 15):
                     dt = datetime(d.year, d.month, d.day, h, 30, tzinfo=DB_TZ)
                     if start <= dt <= end:
                         count += 1
             return count
         elif interval == Interval.DAILY:
-            return len(trading_days_in_range(start.date(), end.date()))
+            return len(days)
         return 0
 
     def _check_minute_continuity(
@@ -324,13 +395,14 @@ class DataQualityService:
         start: datetime,
         end: datetime,
         bar_times: dict[datetime, Any],
+        days: list[date],
     ) -> tuple[list[MissingRange], int]:
         """检查 1m 连续性，返回 (缺失区间, 非交易时段数据数)。"""
         missing_ranges: list[MissingRange] = []
         outside: int = 0
         expected_set: set[time] = set(expected_minutes_for_day(date(2024, 1, 2)))
 
-        for d in trading_days_in_range(start.date(), end.date()):
+        for d in days:
             day_times: list[datetime] = [
                 datetime.combine(d, t).replace(tzinfo=DB_TZ)
                 for t in expected_minutes_for_day(d)
@@ -363,13 +435,14 @@ class DataQualityService:
         start: datetime,
         end: datetime,
         bar_times: dict[datetime, Any],
+        days: list[date],
     ) -> tuple[list[MissingRange], int]:
         """检查 1h 连续性。"""
         missing_ranges: list[MissingRange] = []
         # 1h 期望时间点（vnpy 约定标记区间开始：10:00, 11:00, 14:00, 15:00
         # 经 xt_datafeed adjustment 减 1h 后为 9:30, 10:30, 13:30, 14:30 左右）
         # 第一版用宽松判断：只统计缺失交易日数
-        for d in trading_days_in_range(start.date(), end.date()):
+        for d in days:
             day_bars = [dt for dt in bar_times if dt.date() == d]
             if not day_bars and start.date() <= d <= end.date():
                 missing_ranges.append(MissingRange(
@@ -386,10 +459,11 @@ class DataQualityService:
         start: datetime,
         end: datetime,
         bar_times: dict[datetime, Any],
+        days: list[date],
     ) -> list[MissingRange]:
         """检查日线连续性（缺失交易日）。"""
         missing_ranges: list[MissingRange] = []
-        for d in trading_days_in_range(start.date(), end.date()):
+        for d in days:
             dt: datetime = datetime.combine(d, time(0, 0), tzinfo=DB_TZ)
             if start <= dt <= end and dt not in bar_times:
                 missing_ranges.append(MissingRange(start=dt, end=dt, count=1))
@@ -403,6 +477,8 @@ class DataQualityService:
         interval: Interval,
         start: datetime,
         end: datetime,
+        probe: BarProbe | None = None,
+        trading_days: list[date] | None = None,
     ) -> UniverseQualityReport:
         """批量检查 universe 中所有标的的质量。"""
         report: UniverseQualityReport = UniverseQualityReport(
@@ -416,7 +492,8 @@ class DataQualityService:
 
         for symbol, exchange in symbols:
             sr: DataQualityReport = self.check_bar_data(
-                symbol, exchange, interval, start, end
+                symbol, exchange, interval, start, end,
+                probe=probe, trading_days=trading_days,
             )
             report.symbol_reports.append(sr)
             total_expected += sr.expected_count
@@ -424,8 +501,6 @@ class DataQualityService:
 
             if sr.status == QualityStatus.PASS:
                 report.pass_count += 1
-            elif sr.status == QualityStatus.WARN:
-                report.warn_count += 1
             else:
                 report.fail_count += 1
 
@@ -433,14 +508,9 @@ class DataQualityService:
             total_actual / total_expected
             if total_expected > 0 else 0.0
         )
-
-        # 总体状态：任一 FAIL 且覆盖率低则 FAIL，否则按覆盖率
-        if report.fail_count > 0 and report.overall_coverage < self.FAIL_COVERAGE_THRESHOLD:
-            report.status = QualityStatus.FAIL
-        elif report.warn_count > 0 or report.overall_coverage < 1.0:
-            report.status = QualityStatus.WARN
-        else:
-            report.status = QualityStatus.PASS
+        report.status = (
+            QualityStatus.FAIL if report.fail_count > 0 else QualityStatus.PASS
+        )
 
         return report
 

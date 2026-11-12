@@ -1,6 +1,8 @@
 """历史数据的导入、导出、查询和下载。"""
 import csv
-from datetime import datetime
+import threading
+from datetime import date, datetime
+from time import perf_counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -18,6 +20,10 @@ APP_NAME: str = "DataManager"
 
 # 批量下载进度事件类型（UI 与调度器订阅）
 EVENT_DM_DOWNLOAD_PROGRESS: str = "eDmDownloadProgress."
+
+# 单标的下载超时（秒）：数据源偶发无响应时，不能让它把整批下载拖死。
+# <=0 表示不设超时。超时后该标的不再等待，记为失败（可稍后重试）。
+SYMBOL_TIMEOUT_SECONDS: float = 120.0
 
 
 # 全市场标的枚举常量（与 vnpy_scripttrader/script/market/a_share.py 对齐，
@@ -100,6 +106,10 @@ class ManagerEngine(BaseEngine):
         self.datafeed: BaseDatafeed = get_datafeed()
         # 批量任务：task_id -> 取消标志；UI 与调度器共用
         self._download_tasks: dict[str, dict] = {}
+        # 交易日历缓存：(start_date, end_date) -> 交易日列表（取日历很慢，别重复取）
+        self._trading_dates_cache: dict[tuple[date, date], list[date] | None] = {}
+        # 单标的下载超时（秒），<=0 关闭
+        self.symbol_timeout: float = SYMBOL_TIMEOUT_SECONDS
 
         # 每日定时下载调度服务（不自动启动；由应用层 start_scheduler() 显式拉起，
         # 避免测试与离线场景误起后台线程）。复用本 engine 的 universe 批量接口。
@@ -322,6 +332,115 @@ class ManagerEngine(BaseEngine):
 
         return 0
 
+    def probe_remote_bar_times(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+    ) -> set[datetime] | None:
+        """回源复核：把整段检查周期重新向数据服务取一次，返回源头真实存在的时间点。
+
+        不会写入本地数据库（补数走下载流程，DuckDB 侧按主键幂等覆盖）。
+        返回 None 表示无法复核（服务未就绪等）。
+        """
+        req: HistoryRequest = HistoryRequest(
+            symbol=symbol,
+            exchange=exchange,
+            interval=Interval(interval),
+            start=start,
+            end=end,
+        )
+
+        # 先让数据源把这段原始 K 线补进本地缓存，再读；读不到才说明源头确实没有
+        download = getattr(self.datafeed, "download_bar_history", None)
+        if callable(download):
+            try:
+                if not download(req, lambda msg: None):
+                    self._log_probe(
+                        f"回源补拉 {symbol}.{exchange.value} 失败，无法确认缺口"
+                    )
+                    return None
+            except Exception as ex:
+                self._log_probe(
+                    f"回源补拉 {symbol}.{exchange.value} 异常：{ex}"
+                )
+                return None
+
+        try:
+            data: list[BarData] = self.datafeed.query_bar_history(
+                req, lambda msg: None
+            ) or []
+        except Exception as ex:
+            self._log_probe(
+                f"回源复核 {symbol}.{exchange.value} 失败：{ex}"
+            )
+            return None
+
+        return {bar.datetime for bar in data}
+
+    def _log_probe(self, msg: str) -> None:
+        """回源复核的日志：主引擎不可用时也不能让检查中断。"""
+        try:
+            self.write_log(msg, source="QualityProbe")
+        except Exception:
+            pass
+
+    def _run_with_timeout(self, func: Callable[[], int], name: str) -> int:
+        """在线程里跑一次单标的下载，超时抛 TimeoutError。
+
+        超时后不再等待（孤儿线程是 daemon，返回后自行结束；它写库时仍受
+        DuckDB 的 RLock 串行化保护，不会和后续标的的写入打架）。
+        """
+        timeout: float = float(self.symbol_timeout or 0)
+        if timeout <= 0:
+            return func()
+
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                box["count"] = func()
+            except BaseException as ex:  # noqa: BLE001 - 交给调用方分类计数
+                box["error"] = ex
+
+        thread: threading.Thread = threading.Thread(
+            target=run, daemon=True, name=f"dm-download-{name}",
+        )
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            raise TimeoutError(f"数据源 {timeout:g}s 未返回")
+        error = box.get("error")
+        if error is not None:
+            raise error
+        return int(box.get("count", 0))
+
+    def get_trading_dates(
+        self, start: datetime, end: datetime
+    ) -> list[date] | None:
+        """取 [start, end] 的精确交易日历（QMT），失败返回 None。
+
+        取日历在部分终端上很慢（约 2s/次），所以按区间缓存，一次检查只取一次。
+        """
+        key: tuple[date, date] = (start.date(), end.date())
+        if key in self._trading_dates_cache:
+            return self._trading_dates_cache[key]
+
+        getter = getattr(self.datafeed, "get_trading_dates", None)
+        if not callable(getter):
+            return None
+
+        try:
+            days: list[date] | None = getter(key[0], key[1])
+        except Exception as ex:
+            self._log_probe(f"取交易日历失败：{ex}")
+            return None
+
+        self._trading_dates_cache[key] = days
+        return days
+
     def download_tick_data(
         self,
         symbol: str,
@@ -527,14 +646,32 @@ class ManagerEngine(BaseEngine):
                     dl_start = ov.end
 
             try:
-                count: int = self.download_bar_data(
-                    symbol, exchange, interval, dl_start, output, end
+                symbol_start: float = perf_counter()
+                count: int = self._run_with_timeout(
+                    lambda: self.download_bar_data(
+                        symbol, exchange, interval, dl_start, output, end
+                    ),
+                    vt_symbol,
                 )
+                elapsed: float = perf_counter() - symbol_start
+                if elapsed >= 30:
+                    # 单标的拖慢会让进度条长时间不动，留一行日志便于事后定位
+                    output(
+                        f"下载 {vt_symbol} {interval.value} 耗时 {elapsed:.0f}s"
+                        "（数据源响应慢）"
+                    )
                 if count > 0:
                     success += 1
                 else:
                     # 空数据：数据源无该标的该区间数据，记为跳过而非失败
                     skipped += 1
+            except TimeoutError as ex:
+                failed += 1
+                failed_symbols.append(vt_symbol)
+                output(
+                    f"下载 {vt_symbol} {interval.value} 超时：{ex}"
+                    "（已跳过该标的，可稍后重试）"
+                )
             except Exception as ex:  # noqa: BLE001 - 单标的失败不阻断整批
                 failed += 1
                 failed_symbols.append(vt_symbol)
@@ -607,13 +744,18 @@ class ManagerEngine(BaseEngine):
 
             vt_symbol: str = f"{symbol}.{exchange.value}"
             try:
-                count: int = self.download_tick_data(
-                    symbol, exchange, start, output, end
+                count: int = self._run_with_timeout(
+                    lambda: self.download_tick_data(symbol, exchange, start, output, end),
+                    vt_symbol,
                 )
                 if count > 0:
                     success += 1
                 else:
                     skipped += 1
+            except TimeoutError as ex:
+                failed += 1
+                failed_symbols.append(vt_symbol)
+                output(f"下载 {vt_symbol} Tick 超时：{ex}（已跳过该标的，可稍后重试）")
             except Exception as ex:  # noqa: BLE001
                 failed += 1
                 failed_symbols.append(vt_symbol)

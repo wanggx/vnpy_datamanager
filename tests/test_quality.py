@@ -80,13 +80,13 @@ def test_check_pass_complete_minute_data(database: DuckdbDatabase) -> None:
     assert report.status == QualityStatus.PASS
 
 
-def test_check_warn_missing_some_bars(database: DuckdbDatabase) -> None:
-    """缺失少量 1m bar 应判 WARN（覆盖率 0.95 以下、0.5 以上）。"""
+def test_check_missing_bars_without_probe_is_fail(database: DuckdbDatabase) -> None:
+    """缺 bar 又没回源复核时，保守判 FAIL（不能默默放过）。"""
     from datetime import date
     d = date(2024, 1, 2)
     bars = []
     times = expected_minutes_for_day(d)
-    # 跳过 20 根（240 - 20 = 220，覆盖率 0.917）
+    # 跳过 20 根（240 - 20 = 220）
     for i, t in enumerate(times):
         if i % 12 == 0:  # 每 12 根跳 1 根，约跳 20 根
             continue
@@ -102,8 +102,100 @@ def test_check_warn_missing_some_bars(database: DuckdbDatabase) -> None:
     )
     assert report.actual_count < 240
     assert report.expected_count == 240
-    assert report.status == QualityStatus.WARN
-    assert len(report.missing_ranges) > 0
+    assert report.missing_count > 0
+    assert report.remote_checked is False
+    assert report.status == QualityStatus.FAIL
+
+
+def test_check_missing_bars_confirmed_by_source_is_pass(database: DuckdbDatabase) -> None:
+    """回源复核发现源头同样没有这些 bar（停牌/无成交）→ PASS。"""
+    from datetime import date
+    d = date(2024, 1, 2)
+    bars = []
+    times = expected_minutes_for_day(d)
+    for i, t in enumerate(times):
+        if i % 12 == 0:
+            continue
+        dt = datetime.combine(d, t, tzinfo=DB_TZ)
+        bars.append(make_bar("600000", Exchange.SSE, dt))
+    database.save_bar_data(bars)
+
+    probed: list[tuple[datetime, datetime]] = []
+
+    def probe(symbol, exchange, interval, start, end):
+        probed.append((start, end))
+        return set()   # 源头一根都没有
+
+    svc = DataQualityService(database)
+    report = svc.check_bar_data(
+        "600000", Exchange.SSE, Interval.MINUTE,
+        datetime(2024, 1, 2, 9, 31, tzinfo=DB_TZ),
+        datetime(2024, 1, 2, 15, 0, tzinfo=DB_TZ),
+        probe=probe,
+    )
+    # 回源复核取的是整段检查周期，不是零散的缺失点
+    assert probed == [
+        (datetime(2024, 1, 2, 9, 31, tzinfo=DB_TZ),
+         datetime(2024, 1, 2, 15, 0, tzinfo=DB_TZ))
+    ]
+    assert report.remote_checked is True
+    assert report.remote_gap_count == 0
+    assert report.source_missing_count == report.missing_count > 0
+    assert report.status == QualityStatus.PASS
+
+
+def test_check_missing_bars_present_in_source_is_fail(database: DuckdbDatabase) -> None:
+    """回源复核发现源头有、本地没有（真洞）→ FAIL。"""
+    from datetime import date
+    d = date(2024, 1, 2)
+    times = expected_minutes_for_day(d)
+    bars = [
+        make_bar("600000", Exchange.SSE, datetime.combine(d, t, tzinfo=DB_TZ))
+        for i, t in enumerate(times) if i % 12 != 0
+    ]
+    database.save_bar_data(bars)
+
+    # 源头这一整段都有数据
+    full_day: set[datetime] = {
+        datetime.combine(d, t, tzinfo=DB_TZ) for t in times
+    }
+
+    def probe(symbol, exchange, interval, start, end):
+        return full_day
+
+    svc = DataQualityService(database)
+    report = svc.check_bar_data(
+        "600000", Exchange.SSE, Interval.MINUTE,
+        datetime(2024, 1, 2, 9, 31, tzinfo=DB_TZ),
+        datetime(2024, 1, 2, 15, 0, tzinfo=DB_TZ),
+        probe=probe,
+    )
+    assert report.remote_checked is True
+    assert report.remote_gap_count == report.missing_count > 0
+    assert report.source_missing_count == 0
+    assert report.status == QualityStatus.FAIL
+
+
+def test_check_probe_unavailable_is_fail(database: DuckdbDatabase) -> None:
+    """回源复核失败（数据源未就绪）时按 FAIL 处理，并写明原因。"""
+    from datetime import date
+    d = date(2024, 1, 2)
+    times = expected_minutes_for_day(d)
+    database.save_bar_data([
+        make_bar("600000", Exchange.SSE, datetime.combine(d, t, tzinfo=DB_TZ))
+        for i, t in enumerate(times) if i % 12 != 0
+    ])
+
+    svc = DataQualityService(database)
+    report = svc.check_bar_data(
+        "600000", Exchange.SSE, Interval.MINUTE,
+        datetime(2024, 1, 2, 9, 31, tzinfo=DB_TZ),
+        datetime(2024, 1, 2, 15, 0, tzinfo=DB_TZ),
+        probe=lambda *a: None,
+    )
+    assert report.remote_checked is False
+    assert report.status == QualityStatus.FAIL
+    assert "复核失败" in report.error
 
 
 def test_check_fail_no_data(database: DuckdbDatabase) -> None:
@@ -217,31 +309,60 @@ def test_check_universe_aggregates(database: DuckdbDatabase) -> None:
     assert "000001.SZSE" in report.failed_symbols
 
 
-def test_daily_missing_one_day_is_warn(database: DuckdbDatabase) -> None:
-    """日线缺 1 天（覆盖率 22/23 ≈ 95.7%）也必须 WARN，不能被覆盖率放过。"""
+def test_daily_missing_one_day_confirmed_by_source_is_pass(database: DuckdbDatabase) -> None:
+    """日线缺 1 天，回源确认源头也没有（停牌）→ PASS，不是 WARN/FAIL。"""
     from datetime import date, time
     days = trading_days_in_range(date(2026, 10, 13), date(2026, 11, 12))
     assert len(days) == 23
     skip = days[3]
-    bars = [
+    database.save_bar_data([
         make_bar("000010", Exchange.SZSE,
                  datetime.combine(d, time(0, 0), tzinfo=DB_TZ),
                  interval=Interval.DAILY)
         for d in days if d != skip
-    ]
-    database.save_bar_data(bars)
+    ])
 
     svc = DataQualityService(database)
     start = datetime(2026, 10, 13, tzinfo=DB_TZ)
     end = datetime(2026, 11, 12, 23, 59, 59, tzinfo=DB_TZ)
-    report = svc.check_bar_data("000010", Exchange.SZSE, Interval.DAILY, start, end)
+    report = svc.check_bar_data(
+        "000010", Exchange.SZSE, Interval.DAILY, start, end, probe=lambda *a: set()
+    )
     assert (report.expected_count, report.actual_count) == (23, 22)
-    assert report.status == QualityStatus.WARN
     assert [(mr.start.date(), mr.count) for mr in report.missing_ranges] == [(skip, 1)]
+    assert report.missing_count == 1
+    assert report.source_missing_count == 1
+    assert report.remote_gap_count == 0
+    assert report.status == QualityStatus.PASS
 
 
-def test_universe_problem_symbols_includes_warn(database: DuckdbDatabase) -> None:
-    """problem_symbols 要把 WARN 也算进去（批量修复靠它）。"""
+def test_daily_missing_one_day_present_in_source_is_fail(database: DuckdbDatabase) -> None:
+    """日线缺 1 天，但源头有这一天的数据 → FAIL。"""
+    from datetime import date, time
+    days = trading_days_in_range(date(2026, 10, 13), date(2026, 11, 12))
+    skip = days[3]
+    database.save_bar_data([
+        make_bar("000010", Exchange.SZSE,
+                 datetime.combine(d, time(0, 0), tzinfo=DB_TZ),
+                 interval=Interval.DAILY)
+        for d in days if d != skip
+    ])
+
+    svc = DataQualityService(database)
+    start = datetime(2026, 10, 13, tzinfo=DB_TZ)
+    end = datetime(2026, 11, 12, 23, 59, 59, tzinfo=DB_TZ)
+    day_dt = datetime.combine(skip, time(0, 0), tzinfo=DB_TZ)
+    report = svc.check_bar_data(
+        "000010", Exchange.SZSE, Interval.DAILY, start, end,
+        probe=lambda symbol, exchange, interval, start_, end_: {day_dt},
+    )
+    assert report.remote_checked is True
+    assert report.remote_gap_count == 1
+    assert report.status == QualityStatus.FAIL
+
+
+def test_universe_uses_probe_and_counts_fail(database: DuckdbDatabase) -> None:
+    """universe 检查透传 probe：源头也缺的算 PASS，源头有的算 FAIL。"""
     from datetime import date, time
     days = trading_days_in_range(date(2026, 10, 13), date(2026, 11, 12))
     skip = days[3]
@@ -255,13 +376,83 @@ def test_universe_problem_symbols_includes_warn(database: DuckdbDatabase) -> Non
             for d in days if d != drop
         ])
 
+    # 600000 没有洞 → 不该调用 probe；000010 的洞源头也没有 → PASS
+    calls: list[str] = []
+
+    def probe(symbol, exchange, interval, start, end):
+        calls.append(symbol)
+        return set()
+
     svc = DataQualityService(database)
     report = svc.check_universe_data(
         [("600000", Exchange.SSE), ("000010", Exchange.SZSE)],
         Interval.DAILY,
         datetime(2026, 10, 13, tzinfo=DB_TZ),
         datetime(2026, 11, 12, 23, 59, 59, tzinfo=DB_TZ),
+        probe=probe,
     )
-    assert (report.pass_count, report.warn_count, report.fail_count) == (1, 1, 0)
-    assert report.problem_symbols == ["000010.SZSE"]
+    assert calls == ["000010"]
+    assert (report.pass_count, report.fail_count) == (2, 0)
+    assert report.status == QualityStatus.PASS
     assert report.failed_symbols == []
+
+    # 换成源头有数据的 probe → 000010 变 FAIL
+    all_days: set[datetime] = {
+        datetime.combine(d, time(0, 0), tzinfo=DB_TZ) for d in days
+    }
+    report2 = svc.check_universe_data(
+        [("600000", Exchange.SSE), ("000010", Exchange.SZSE)],
+        Interval.DAILY,
+        datetime(2026, 10, 13, tzinfo=DB_TZ),
+        datetime(2026, 11, 12, 23, 59, 59, tzinfo=DB_TZ),
+        probe=lambda symbol, exchange, interval, start, end: all_days,
+    )
+    assert (report2.pass_count, report2.fail_count) == (1, 1)
+    assert report2.failed_symbols == ["000010.SZSE"]
+    assert report2.status == QualityStatus.FAIL
+
+
+def test_holiday_is_not_a_gap_and_skips_probe(database: DuckdbDatabase) -> None:
+    """节假日不是缺口：传了精确交易日历后不应回源拉数（否则全市场白拉一遍）。"""
+    from datetime import date, time
+    start = datetime(2026, 9, 28, tzinfo=DB_TZ)
+    end = datetime(2026, 10, 9, 23, 59, 59, tzinfo=DB_TZ)
+    # 国庆休市：10-01/02/05/06/07/08 不是交易日
+    holidays = {
+        date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 5),
+        date(2026, 10, 6), date(2026, 10, 7), date(2026, 10, 8),
+    }
+    days = [
+        d for d in trading_days_in_range(start.date(), end.date())
+        if d not in holidays
+    ]
+    database.save_bar_data([
+        make_bar("600036", Exchange.SSE,
+                 datetime.combine(d, time(0, 0), tzinfo=DB_TZ),
+                 interval=Interval.DAILY)
+        for d in days
+    ])
+
+    calls: list[str] = []
+
+    def probe(symbol, exchange, interval, start_, end_):
+        calls.append(symbol)
+        return set()
+
+    svc = DataQualityService(database)
+    report = svc.check_bar_data(
+        "600036", Exchange.SSE, Interval.DAILY, start, end,
+        probe=probe, trading_days=days,
+    )
+    assert report.expected_count == len(days) == 4
+    assert report.actual_count == 4
+    assert report.missing_count == 0
+    assert calls == []
+    assert report.status == QualityStatus.PASS
+
+    # 对照：不传日历（只排除周末）时节假日会被当成洞，于是触发回源
+    report2 = svc.check_bar_data(
+        "600036", Exchange.SSE, Interval.DAILY, start, end, probe=probe
+    )
+    assert report2.missing_count == 6
+    assert calls == ["600036"]

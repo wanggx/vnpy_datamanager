@@ -3,7 +3,7 @@
 独立对话框，同步执行检查、两层进度，总览/按标的两视图，
 支持取消、导出报告、按标的或批量修复缺口。
 """
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from vnpy.trader.ui import QtWidgets, QtCore
 from vnpy.trader.constant import Exchange, Interval
@@ -37,6 +37,7 @@ class DataQualityDialog(QtWidgets.QDialog):
         self._report: UniverseQualityReport | None = None
         self._cancelled: bool = False
         self._symbol_rows: dict[str, int] = {}
+        self._trading_days: list[date] | None = None
 
         self._init_ui()
 
@@ -168,7 +169,7 @@ class DataQualityDialog(QtWidgets.QDialog):
             self._set_busy(False)
 
     def _check(self) -> None:
-        """检查主体。"""
+        """检查主体：本地按日历查洞，有洞的标的再回源（大 QMT）复核。"""
         interval: Interval = Interval(self.interval_combo.currentData())
         start_date: QtCore.QDate = self.start_date_edit.date()
         end_date: QtCore.QDate = self.end_date_edit.date()
@@ -184,6 +185,10 @@ class DataQualityDialog(QtWidgets.QDialog):
             self.phase_label.setText("未获取到标的（大 QMT 服务可能未启动）")
             return
 
+        # 精确交易日历（剔除节假日）：整轮检查只取一次，避免节假日被当成缺口
+        # 而触发全市场无谓的回源拉数。
+        self._trading_days = self._load_trading_days(start, end)
+
         # 逐标的检查，更新进度
         report: UniverseQualityReport = UniverseQualityReport(
             universe=universe.name, interval=interval, start=start, end=end,
@@ -197,51 +202,86 @@ class DataQualityDialog(QtWidgets.QDialog):
                 self.phase_label.setText("已取消")
                 break
             sr: DataQualityReport = self.service.check_bar_data(
-                symbol, exchange, interval, start, end
+                symbol, exchange, interval, start, end,
+                probe=self._probe_remote, trading_days=self._trading_days,
             )
             report.symbol_reports.append(sr)
             total_expected += sr.expected_count
             total_actual += sr.actual_count
             if sr.status == QualityStatus.PASS:
                 report.pass_count += 1
-            elif sr.status == QualityStatus.WARN:
-                report.warn_count += 1
             else:
                 report.fail_count += 1
 
             # 进度
             pct: int = int((idx + 1) / report.total_symbols * 100)
             self.progress_bar.setValue(pct)
+            detail: str = ""
+            if sr.missing_count:
+                detail = f" · 本地缺 {sr.missing_count} 根"
+                if sr.remote_checked:
+                    detail += f"，QMT 亦无 {sr.source_missing_count} 根"
+                else:
+                    detail += "，QMT 复核失败"
             self.phase_label.setText(
-                f"检查中 · {idx + 1}/{report.total_symbols} · 当前 {symbol}.{exchange.value}"
+                f"检查中 · {idx + 1}/{report.total_symbols} · "
+                f"{symbol}.{exchange.value}{detail}"
             )
             QtWidgets.QApplication.processEvents()
 
         report.overall_coverage = total_actual / total_expected if total_expected else 0.0
-        if report.fail_count > 0 and report.overall_coverage < self.service.FAIL_COVERAGE_THRESHOLD:
-            report.status = QualityStatus.FAIL
-        elif report.warn_count > 0:
-            report.status = QualityStatus.WARN
-        else:
-            report.status = QualityStatus.PASS
+        report.status = (
+            QualityStatus.FAIL if report.fail_count > 0 else QualityStatus.PASS
+        )
 
         self._report = report
         self._render_report(report)
         self.phase_label.setText("检查完成")
         self.progress_bar.setValue(100)
 
+    def _load_trading_days(
+        self, start: datetime, end: datetime
+    ) -> list[date] | None:
+        """取精确交易日历（QMT）；拿不到返回 None，服务层退化为只排除周末。"""
+        getter = getattr(self.engine, "get_trading_dates", None)
+        if not callable(getter):
+            return None
+        self.phase_label.setText("获取交易日历...")
+        QtWidgets.QApplication.processEvents()
+        try:
+            days: list[date] | None = getter(start, end)
+        except Exception as ex:
+            self.engine.write_log(f"取交易日历失败：{ex}", source="DataQuality")
+            return None
+        return days
+
+    def _probe_remote(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+    ) -> set[datetime] | None:
+        """回源复核：把整段周期重新向数据源取一次（只读，不落库）。"""
+        if not hasattr(self.engine, "probe_remote_bar_times"):
+            return None
+        self.phase_label.setText(f"回源复核 · {symbol}.{exchange.value}（整段重取）")
+        QtWidgets.QApplication.processEvents()
+        return self.engine.probe_remote_bar_times(symbol, exchange, interval, start, end)
+
     def _cancel(self) -> None:
         """请求取消检查。"""
         self._cancelled = True
 
     def _render_report(self, report: UniverseQualityReport) -> None:
-        """把报告渲染到三个 Tab（默认只渲染异常标的）。"""
+        """把报告渲染到各 Tab（默认只渲染异常标的）。"""
         only_problem: bool = self.only_problem_check.isChecked()
-        problem_count: int = report.warn_count + report.fail_count
+        problem_count: int = report.fail_count
         # 总览
         self.overview_label.setText(
             f"标的总数：{report.total_symbols}  通过：{report.pass_count}  "
-            f"警告：{report.warn_count}  失败：{report.fail_count}  "
+            f"失败：{report.fail_count}  "
             f"总体覆盖率：{report.overall_coverage * 100:.1f}%  状态：{report.status.value}"
             + (f"　（下表只显示 {problem_count} 个异常标的）" if only_problem else "")
         )
@@ -260,7 +300,13 @@ class DataQualityDialog(QtWidgets.QDialog):
             self._symbol_rows[f"{sr.symbol}.{sr.exchange.value}"] = row
 
     def _format_missing(self, sr: DataQualityReport) -> str:
-        """缺失区间描述：日线只显示日期（00:00-00:00 没有意义），分钟线带日期与时刻。"""
+        """缺失区间描述 + 回源复核结论。
+
+        日线只显示日期（00:00-00:00 没有意义），分钟线带日期与时刻；末尾附上
+        「QMT 亦无 → 正常」或「QMT 有数据 → 本地缺」的结论。
+        """
+        if not sr.missing_ranges:
+            return ""
         parts: list[str] = []
         daily: bool = sr.interval == Interval.DAILY
         for mr in sr.missing_ranges[:3]:
@@ -278,7 +324,17 @@ class DataQualityDialog(QtWidgets.QDialog):
                 )
         if len(sr.missing_ranges) > 3:
             parts.append(f"…共 {len(sr.missing_ranges)} 段")
-        return "; ".join(parts)
+        text: str = "; ".join(parts)
+        if sr.remote_checked:
+            if sr.remote_gap_count:
+                verdict = f"（QMT 有 {sr.remote_gap_count} 根，本地缺）"
+            else:
+                verdict = "（QMT 亦无，属正常缺口）"
+        elif sr.error:
+            verdict = f"（{sr.error}）"
+        else:
+            verdict = ""
+        return text + verdict
 
     def _fill_symbol_row(self, row: int, sr: DataQualityReport) -> None:
         """填一行按标的报告（含操作列的「修复」按钮）。"""
@@ -301,11 +357,10 @@ class DataQualityDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _status_color(status: QualityStatus) -> 'QtCore.QBrush':
-        """状态颜色：PASS 绿、WARN 橙、FAIL 红。"""
+        """状态颜色：PASS 绿、FAIL 红。"""
         from vnpy.trader.ui import QtGui
         color_map: dict = {
             QualityStatus.PASS: QtGui.QColor("#2d9465"),
-            QualityStatus.WARN: QtGui.QColor("#ba8136"),
             QualityStatus.FAIL: QtGui.QColor("#b84d4d"),
         }
         return QtGui.QBrush(color_map.get(status, QtGui.QColor("#c1cbd3")))
@@ -320,27 +375,31 @@ class DataQualityDialog(QtWidgets.QDialog):
         import csv
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer: csv.writer = csv.writer(f)
-            writer.writerow(["标的", "期望", "实际", "重复", "OHLC错误", "状态"])
+            writer.writerow([
+                "标的", "期望", "实际", "本地缺失", "QMT确认缺失",
+                "QMT有本地无", "重复", "OHLC错误", "状态", "备注",
+            ])
             for sr in self._report.symbol_reports:
                 writer.writerow([
                     f"{sr.symbol}.{sr.exchange.value}", sr.expected_count,
-                    sr.actual_count, sr.duplicate_count, sr.ohlc_error_count,
-                    sr.status.value,
+                    sr.actual_count, sr.missing_count, sr.source_missing_count,
+                    sr.remote_gap_count, sr.duplicate_count, sr.ohlc_error_count,
+                    sr.status.value, sr.error,
                 ])
         QtWidgets.QMessageBox.information(self, "导出", f"报告已导出到 {path}")
 
     def _repair_gaps(self) -> None:
-        """批量修复缺口：对警告/失败（只要有缺口）的标的重新下载。"""
-        if not self._report or not self._report.problem_symbols:
-            QtWidgets.QMessageBox.information(self, "修复", "无异常标的需修复")
+        """批量修复：把 FAIL 的标的按当前条件重新下载一遍。"""
+        if not self._report or not self._report.failed_symbols:
+            QtWidgets.QMessageBox.information(self, "修复", "无失败标的需修复")
             return
-        problem: list[str] = list(self._report.problem_symbols)
+        failed: list[str] = list(self._report.failed_symbols)
         start, end = self._selected_range()
-        self._download_symbols("批量修复缺口", problem, start, end)
-        self._recheck_symbols(problem)
+        self._download_symbols("批量修复", failed, start, end)
+        self._recheck_symbols(failed)
 
     def _repair_symbol(self, sr: DataQualityReport) -> None:
-        """按标的修复：只重下这一只缺口区间的数据，然后复算刷新。"""
+        """按标的修复：整个检查周期重新下载这一只，写完再复算（写入幂等）。"""
         start, end = self._selected_range()
         vt_symbol: str = f"{sr.symbol}.{sr.exchange.value}"
         self._download_symbols("修复标的", [vt_symbol], start, end)
@@ -357,7 +416,7 @@ class DataQualityDialog(QtWidgets.QDialog):
     def _download_symbols(
         self, title: str, symbols: list[str], start: datetime, end: datetime
     ) -> None:
-        """按指定标的与区间增量下载，期间置灰所有操作按钮。"""
+        """整个检查周期重新下载（DuckDB 按主键幂等覆盖，重复下载安全）。"""
         interval: Interval = Interval(self.interval_combo.currentData())
         universe: DataUniverse = DataUniverse(
             name=self.universe_combo.currentText(), source="xtquant"
@@ -392,7 +451,8 @@ class DataQualityDialog(QtWidgets.QDialog):
         interval: Interval = Interval(self.interval_combo.currentData())
         try:
             latest: DataQualityReport = self.service.check_bar_data(
-                sr.symbol, sr.exchange, interval, start, end
+                sr.symbol, sr.exchange, interval, start, end,
+                probe=self._probe_remote, trading_days=self._trading_days,
             )
         except Exception as ex:
             self.engine.write_log(f"复查 {sr.symbol} 失败：{ex}", source="QualityRepair")
@@ -406,16 +466,15 @@ class DataQualityDialog(QtWidgets.QDialog):
         # 先减掉旧状态，再加上新状态，避免计数漂移
         if sr.status == QualityStatus.PASS:
             self._report.pass_count -= 1
-        elif sr.status == QualityStatus.WARN:
-            self._report.warn_count -= 1
         else:
             self._report.fail_count -= 1
         if latest.status == QualityStatus.PASS:
             self._report.pass_count += 1
-        elif latest.status == QualityStatus.WARN:
-            self._report.warn_count += 1
         else:
             self._report.fail_count += 1
+        self._report.status = (
+            QualityStatus.FAIL if self._report.fail_count > 0 else QualityStatus.PASS
+        )
         if render:
             self._render_report(self._report)
 

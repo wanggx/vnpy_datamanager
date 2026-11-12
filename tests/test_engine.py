@@ -250,3 +250,122 @@ def test_output_csv_writes_bars_in_range_and_skips_empty_range(
     assert empty_ok is True
     assert empty_header == HEADER
     assert empty_rows == []
+
+
+class RecordingDatafeed:
+    """记录回源补拉与查询的假数据服务。"""
+
+    def __init__(self, download_ok: bool = True, bars: list[BarData] | None = None) -> None:
+        self.download_ok: bool = download_ok
+        self.bars: list[BarData] = list(bars or [])
+        self.downloaded: list[tuple[datetime, datetime]] = []
+        self.queried: list[tuple[datetime, datetime]] = []
+
+    def download_bar_history(self, req: object, output: object = print) -> bool:
+        self.downloaded.append((req.start, req.end))  # type: ignore[attr-defined]
+        return self.download_ok
+
+    def query_bar_history(self, req: object, output: object = print) -> list[BarData]:
+        self.queried.append((req.start, req.end))  # type: ignore[attr-defined]
+        return list(self.bars)
+
+
+def test_probe_remote_bar_times_downloads_then_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回源复核：整个检查周期先补拉再读，返回源头真实存在的时间点。"""
+    engine: ManagerEngine = make_engine(monkeypatch, RecordingDatabase())
+    start: datetime = datetime(2026, 10, 13, tzinfo=TZ)
+    end: datetime = datetime(2026, 11, 12, 23, 59, 59, tzinfo=TZ)
+    day2: datetime = datetime(2026, 10, 16, tzinfo=TZ)
+    feed: RecordingDatafeed = RecordingDatafeed(
+        bars=[make_bar(day2, 1, 1, 1, 1, 1, 1, 0)]
+    )
+    engine.datafeed = feed  # type: ignore[assignment]
+
+    result: set[datetime] | None = engine.probe_remote_bar_times(
+        "rb2501", Exchange.SHFE, Interval.MINUTE, start, end
+    )
+
+    assert feed.downloaded == [(start, end)]
+    assert feed.queried == [(start, end)]
+    assert result == {day2}
+
+
+def test_probe_remote_bar_times_download_failure_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """补拉失败时返回 None（无法复核），不能当成「源头没有」。"""
+    engine: ManagerEngine = make_engine(monkeypatch, RecordingDatabase())
+    feed: RecordingDatafeed = RecordingDatafeed(download_ok=False)
+    engine.datafeed = feed  # type: ignore[assignment]
+
+    result: set[datetime] | None = engine.probe_remote_bar_times(
+        "rb2501", Exchange.SHFE, Interval.MINUTE,
+        datetime(2026, 10, 13, tzinfo=TZ),
+        datetime(2026, 11, 12, 23, 59, 59, tzinfo=TZ),
+    )
+
+    assert result is None
+    assert feed.queried == []
+
+
+def test_probe_remote_bar_times_without_download_hook_queries_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """数据服务没有补拉能力时退化为直接读缓存（老数据源兼容）。"""
+    engine: ManagerEngine = make_engine(monkeypatch, RecordingDatabase())
+    day2: datetime = datetime(2026, 10, 16, tzinfo=TZ)
+    feed = type(
+        "QueryOnlyFeed", (), {
+            "queried": [],
+            "query_bar_history": lambda self, req, output=print: (
+                self.queried.append((req.start, req.end))  # type: ignore[attr-defined]
+                or [make_bar(day2, 1, 1, 1, 1, 1, 1, 0)]
+            ),
+        }
+    )()
+    engine.datafeed = feed  # type: ignore[assignment]
+
+    result: set[datetime] | None = engine.probe_remote_bar_times(
+        "rb2501", Exchange.SHFE, Interval.MINUTE, day2, day2
+    )
+
+    assert result == {day2}
+    assert feed.queried == [(day2, day2)]
+
+
+def test_get_trading_dates_uses_datafeed_and_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """交易日历来自数据服务，同一区间只取一次（取日历很慢）。"""
+    engine: ManagerEngine = make_engine(monkeypatch, RecordingDatabase())
+    calls: list[tuple[object, object]] = []
+
+    class CalendarFeed:
+        def get_trading_dates(self, start: object, end: object) -> list[object]:
+            calls.append((start, end))
+            from datetime import date
+            return [date(2026, 10, 13), date(2026, 10, 14)]
+
+    engine.datafeed = CalendarFeed()  # type: ignore[assignment]
+    start: datetime = datetime(2026, 10, 13, tzinfo=TZ)
+    end: datetime = datetime(2026, 10, 16, 23, 59, 59, tzinfo=TZ)
+
+    first = engine.get_trading_dates(start, end)
+    second = engine.get_trading_dates(start, end)
+
+    assert first is not None and len(first) == 2
+    assert second == first
+    assert len(calls) == 1
+    assert calls[0] == (start.date(), end.date())
+
+
+def test_get_trading_dates_without_hook_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """数据服务不支持日历时返回 None（调用方退化为只排除周末）。"""
+    engine: ManagerEngine = make_engine(monkeypatch, RecordingDatabase())
+    assert engine.get_trading_dates(
+        datetime(2026, 10, 13, tzinfo=TZ), datetime(2026, 10, 16, tzinfo=TZ)
+    ) is None

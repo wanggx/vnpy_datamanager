@@ -1,5 +1,6 @@
 """数据管理界面组件。"""
 import threading
+import time
 import uuid
 from collections.abc import Sequence
 from functools import partial
@@ -933,6 +934,13 @@ class DownloadDialog(QtWidgets.QDialog):
         self.signal_progress.connect(self.process_progress_event)
         event_engine.register(EVENT_DM_DOWNLOAD_PROGRESS, self.signal_progress.emit)
 
+        # 心跳：单个标的可能在数据源里卡住，进度条不动时至少能看到「已等待多久」
+        self._progress_started_at: float = time.monotonic()
+        self._symbol_started_at: float = self._progress_started_at
+        self._progress_last_phase: str = "准备下载"
+        self._progress_last_symbol: str = ""
+        self._progress_counts: tuple[int, int, int, int] = (0, 0, 0, 0)
+
         # 进度对话框（模态，主线程在 exec_ 上等信号槽，不跑下载）
         self._progress_dialog: QtWidgets.QProgressDialog = QtWidgets.QProgressDialog(
             "准备下载...", "取消", 0, 0, self
@@ -954,7 +962,11 @@ class DownloadDialog(QtWidgets.QDialog):
         self._download_thread.start()
 
         # 阻塞等进度对话框关闭（终态时 process_progress_event 调 reset()）
+        self._progress_timer: QtCore.QTimer = QtCore.QTimer(self)
+        self._progress_timer.timeout.connect(self._tick_progress)
+        self._progress_timer.start(1000)
         self._progress_dialog.exec_()
+        self._progress_timer.stop()
 
         # 结果汇总（沿用原 download 末尾的格式）
         result: DownloadTaskResult | None = self._last_result
@@ -965,6 +977,27 @@ class DownloadDialog(QtWidgets.QDialog):
                 f"失败：{result.failed}\n跳过：{result.skipped}",
                 QtWidgets.QMessageBox.StandardButton.Ok,
             )
+
+    def _tick_progress(self) -> None:
+        """每秒刷新一次进度文案，用来分辨是整体在跑还是某个标的卡住。"""
+        if not hasattr(self, "_progress_dialog"):
+            return
+        self._progress_dialog.setLabelText(self._progress_label())
+
+    def _progress_label(self) -> str:
+        """进度文案：阶段/标的 + 三个计数 + 已等待时长（每秒刷新）。"""
+        success, failed, skipped, total = self._progress_counts
+        waited: int = int(time.monotonic() - self._progress_started_at)
+        symbol_waited: int = int(time.monotonic() - self._symbol_started_at)
+        symbol: str = self._progress_last_symbol or "—"
+        text: str = (
+            f"{self._progress_last_phase}：{symbol}\n"
+            f"成功 {success}  失败 {failed}  跳过 {skipped}  /  总数 {total}\n"
+            f"累计 {waited}s · 当前标的 {symbol_waited}s"
+        )
+        if symbol_waited >= 30:
+            text += "\n数据源响应慢：取消会在当前标的返回后生效"
+        return text
 
     def _cancel_download(self) -> None:
         """进度对话框取消按钮：请求引擎在当前标的后停止（非立即）。"""
@@ -1032,11 +1065,16 @@ class DownloadDialog(QtWidgets.QDialog):
         if total > 0:
             dialog.setMaximum(total)
         dialog.setValue(done)
-        dialog.setLabelText(
-            f"{p.phase}：{p.current_symbol or '—'}\n"
-            f"成功 {p.completed_symbols}  失败 {p.failed_symbols}  "
-            f"跳过 {p.skipped_symbols}  /  总数 {total}"
+
+        # 记录心跳状态：换标的时重置「当前标的」计时，便于发现某个标的卡住
+        if p.current_symbol != self._progress_last_symbol:
+            self._symbol_started_at = time.monotonic()
+        self._progress_last_phase = p.phase
+        self._progress_last_symbol = p.current_symbol
+        self._progress_counts = (
+            p.completed_symbols, p.failed_symbols, p.skipped_symbols, total,
         )
+        dialog.setLabelText(self._progress_label())
 
         # 终态：存结果并关闭对话框（触发 exec_ 返回）
         if p.status in (

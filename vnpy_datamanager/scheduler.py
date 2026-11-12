@@ -193,11 +193,15 @@ class ScheduledDownloadService:
 
     # -- 执行 ---------------------------------------------------------
 
-    def run_now(self) -> ScheduledDownloadStatus:
-        """立即执行一次定时下载任务（按配置的周期 + 追赶策略）。"""
+    def run_now(self, task_id: str | None = None) -> ScheduledDownloadStatus:
+        """立即执行一次定时下载任务（按配置的周期 + 追赶策略）。
+
+        task_id 由调用方（界面）传入时，可用它过滤本任务发出的下载进度事件。
+        """
         import uuid
 
-        task_id: str = str(uuid.uuid4())
+        if not task_id:
+            task_id = str(uuid.uuid4())
         now: datetime = datetime.now(DB_TZ)
         status: ScheduledDownloadStatus = ScheduledDownloadStatus(
             task_id=task_id, planned_at=now,

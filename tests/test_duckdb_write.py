@@ -281,3 +281,44 @@ def test_universe_no_symbols_when_xtdata_unavailable(
     )
     assert result.total == 0
     assert result.success == 0
+
+
+def test_universe_download_symbol_timeout_marks_failed(
+    monkeypatch, database: DuckdbDatabase,
+) -> None:
+    """单标的超时记失败并继续：不能让一只标的把整批卡在 99%。"""
+    import time
+
+    symbols = [
+        ("600000", Exchange.SSE), ("000001", Exchange.SZSE), ("600519", Exchange.SSE),
+    ]
+    _mock_xtdata(monkeypatch, symbols)
+    base = datetime(2024, 1, 2, 9, 31, tzinfo=DB_TZ)
+
+    def query_bar_history(req, output=None):
+        if req.symbol == "000001":
+            time.sleep(2)          # 数据源迟迟不返回
+            return []
+        return [
+            make_bar(req.symbol, req.exchange, req.start + timedelta(minutes=i))
+            for i in range(3)
+        ]
+
+    datafeed = MagicMock()
+    datafeed.query_bar_history.side_effect = query_bar_history
+    engine = make_engine(monkeypatch, database, datafeed)
+    engine.symbol_timeout = 0.2    # 200ms 就判超时
+
+    logs: list[str] = []
+    result = engine.download_universe_bar_data(
+        DataUniverse(name="沪深全市场", source="xtquant"), Interval.MINUTE,
+        base, base + timedelta(minutes=5), output=logs.append,
+        mode=DownloadMode.REPLACE,
+    )
+
+    assert result.status == DownloadTaskStatus.COMPLETED
+    assert result.total == 3
+    assert result.success == 2
+    assert result.failed == 1
+    assert result.failed_symbols == ["000001.SZSE"]
+    assert any("超时" in msg for msg in logs)
