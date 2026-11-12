@@ -1,6 +1,6 @@
 """每日定时下载任务对话框（对应阶段一原型 stage1-scheduled-download-vnpy）。
 
-配置每天 04:00 批量下载 1m/1h，查看任务状态、立即执行、查看任务记录。
+配置每天 04:00 批量下载 1m/1d，查看任务状态、立即执行、查看任务记录。
 """
 from datetime import datetime
 
@@ -51,8 +51,8 @@ class ScheduledDownloadDialog(QtWidgets.QDialog):
 
         self.interval_1m_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("1m")
         self.interval_1m_check.setChecked("1m" in cfg.intervals)
-        self.interval_1h_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("1h")
-        self.interval_1h_check.setChecked("1h" in cfg.intervals)
+        self.interval_1d_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("1d")
+        self.interval_1d_check.setChecked("1d" in cfg.intervals)
 
         self.repair_days_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         for n in [1, 2, 3, 5]:
@@ -84,7 +84,7 @@ class ScheduledDownloadDialog(QtWidgets.QDialog):
         s_form.addRow("数据集合", self.universe_combo)
         interval_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         interval_row.addWidget(self.interval_1m_check)
-        interval_row.addWidget(self.interval_1h_check)
+        interval_row.addWidget(self.interval_1d_check)
         interval_row.addStretch()
         s_form.addRow("周期", interval_row)
         s_form.addRow("追赶范围", self.repair_days_combo)
@@ -112,8 +112,11 @@ class ScheduledDownloadDialog(QtWidgets.QDialog):
         intervals: list[str] = []
         if self.interval_1m_check.isChecked():
             intervals.append("1m")
-        if self.interval_1h_check.isChecked():
-            intervals.append("1h")
+        if self.interval_1d_check.isChecked():
+            intervals.append("1d")
+        if not intervals:
+            QtWidgets.QMessageBox.warning(self, "提示", "请至少勾选一个周期（1m / 1d）")
+            return
         cfg: ScheduledDownloadConfig = ScheduledDownloadConfig(
             enabled=self.enabled_check.isChecked(),
             run_time=self.run_time_edit.text().strip() or "04:00",
@@ -152,7 +155,7 @@ class ScheduledDownloadDialog(QtWidgets.QDialog):
             f"计划时间：{status.planned_at:%Y-%m-%d %H:%M:%S}\n"
             f"目标交易日：{status.target_trading_day}\n"
             f"状态：{status.status}\n"
-            f"1m/1h 合计：成功 {status.success_symbols} / 失败 {status.failed_symbols} / "
+            f"1m/1d 合计：成功 {status.success_symbols} / 失败 {status.failed_symbols} / "
             f"总数 {status.total_symbols}\n覆盖率：{status.coverage_ratio * 100:.1f}%\n"
             f"重试次数：{status.retry_count}\n"
             f"错误：{status.error_summary or '无'}"

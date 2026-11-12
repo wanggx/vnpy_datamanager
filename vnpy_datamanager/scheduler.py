@@ -1,6 +1,6 @@
 """每日定时下载调度服务。
 
-阶段一第 3 步：每天 04:00（Asia/Shanghai）自动下载沪深全市场 1m/1h 行情，
+阶段一第 3 步：每天 04:00（Asia/Shanghai）自动下载沪深全市场 1m/1d 行情，
 写入 vnpy.duckdb 并触发质量检查。采用最近 3 个交易日的追赶策略，失败重试，
 应用启动时补偿错过的任务。
 
@@ -36,7 +36,27 @@ EVENT_DM_SCHEDULE_STATUS: str = "eDmScheduleStatus."
 class ScheduleTaskType(Enum):
     """调度任务类型。"""
     DOWNLOAD_1M = "1m"
-    DOWNLOAD_1H = "1h"
+    DOWNLOAD_1D = "1d"
+
+
+# 定时下载支持的周期。不含 1h：A 股小时线要另外合成，定时补数收益低。
+SUPPORTED_INTERVALS: tuple[str, ...] = ("1m", "1d")
+
+
+def normalize_intervals(intervals: object) -> list[str]:
+    """把配置里的周期收敛到 ``SUPPORTED_INTERVALS``（保序、去重）。
+
+    旧配置可能存着 ``["1m", "1h"]``，这里静默丢掉 1h；全丢光时回退默认
+    ``["1m", "1d"]``，避免定时任务因为周期为空而什么都不做。
+    """
+    if not isinstance(intervals, (list, tuple)):
+        return list(SUPPORTED_INTERVALS)
+    result: list[str] = []
+    for value in intervals:
+        text: str = str(value).strip().lower()
+        if text in SUPPORTED_INTERVALS and text not in result:
+            result.append(text)
+    return result or list(SUPPORTED_INTERVALS)
 
 
 @dataclass
@@ -46,7 +66,7 @@ class ScheduledDownloadConfig:
     run_time: str = "04:00"              # Asia/Shanghai 本地时间
     timezone: str = "Asia/Shanghai"
     universe: str = "沪深全市场"
-    intervals: list[str] = field(default_factory=lambda: ["1m", "1h"])
+    intervals: list[str] = field(default_factory=lambda: ["1m", "1d"])
     repair_days: int = 3                 # 追赶最近 N 个交易日
     max_retries: int = 3
     retry_delay_seconds: int = 60
@@ -105,7 +125,7 @@ class ScheduledDownloadService:
         cfg.run_time = raw.get("run_time", cfg.run_time)
         cfg.timezone = raw.get("timezone", cfg.timezone)
         cfg.universe = raw.get("universe", cfg.universe)
-        cfg.intervals = raw.get("intervals", cfg.intervals)
+        cfg.intervals = normalize_intervals(raw.get("intervals", cfg.intervals))
         cfg.repair_days = raw.get("repair_days", cfg.repair_days)
         cfg.max_retries = raw.get("max_retries", cfg.max_retries)
         cfg.retry_delay_seconds = raw.get("retry_delay_seconds", cfg.retry_delay_seconds)
@@ -302,7 +322,6 @@ class ScheduledDownloadService:
     def _str_to_interval(s: str) -> Interval | None:
         return {
             "1m": Interval.MINUTE,
-            "1h": Interval.HOUR,
             "1d": Interval.DAILY,
         }.get(s)
 

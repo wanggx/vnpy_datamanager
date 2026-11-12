@@ -1,8 +1,12 @@
 # 1.2.1版本
 
-1. 修复下载数据窗口关闭按钮不可点击的问题
-2. 补充公开接口文档和类型注解，增加离线测试并在持续集成中运行
-3. 修复 `ManagerEngine` 缺少 `write_log` 导致「数据管理」下载线程被 `AttributeError`
+1. **定时下载周期改为 1m / 1d**：去掉小时线（1h 需要另外合成，定时补数收益低），
+   默认周期改为 `["1m", "1d"]`；旧配置里存着的 `1h` 在载入时由
+   `normalize_intervals()` 静默丢弃，全丢光时回退默认值；界面两个周期都不勾时
+   拒绝保存并提示。
+2. 修复下载数据窗口关闭按钮不可点击的问题
+3. 补充公开接口文档和类型注解，增加离线测试并在持续集成中运行
+4. 修复 `ManagerEngine` 缺少 `write_log` 导致「数据管理」下载线程被 `AttributeError`
    打断的问题：界面、定时调度与质检对话框都用 `engine.write_log(msg, source=...)`
    打日志，而 `BaseEngine` 并没有这个方法（只有 `MainEngine` 有），于是每条日志
    都抛异常——真正的下载错误被掩盖成 `'ManagerEngine' object has no attribute
