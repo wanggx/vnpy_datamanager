@@ -144,6 +144,10 @@ class ManagerEngine(BaseEngine):
         self._trading_dates_cache: dict[tuple[date, date], list[date] | None] = {}
         # 单标的下载超时（秒），<=0 关闭
         self.symbol_timeout: float = SYMBOL_TIMEOUT_SECONDS
+        # 查询为空时是否让数据源现拉（download_history_data2）。
+        # 默认关闭：桥侧补拉最长等几分钟，遇到数据源本来就没有的标的（指数最典型）
+        # 就表现为"下载不动"；需要补数据时再显式打开。
+        self.auto_download_on_empty: bool = False
 
         # 每日定时下载调度服务（不自动启动；由应用层 start_scheduler() 显式拉起，
         # 避免测试与离线场景误起后台线程）。复用本 engine 的 universe 批量接口。
@@ -359,16 +363,16 @@ class ManagerEngine(BaseEngine):
         # Otherwise use datafeed to query data
         else:
             data = self.datafeed.query_bar_history(req, output)
-            if not data:
-                # 本地区间没缓存时数据源直接回空（指数、刚补进来的新标的都这样）。
-                # 先让它把这段拉进本地缓存再查一次；区间已按 MINUTE_CHUNK_DAYS 拆小，
-                # 这次补拉不会又变成一个大请求。
+            if not data and self.auto_download_on_empty:
+                # 本地没缓存时数据源直接回空（刚补进来的新标的常见）。先让它把这段
+                # 拉进本地缓存再查一次。默认关闭：桥侧补拉最长会等几分钟，遇到
+                # 数据源没有的标的（例如指数）就会表现为"下载不动"，把界面卡死。
                 download = getattr(self.datafeed, "download_bar_history", None)
                 if callable(download):
                     try:
-                        download(req, lambda msg: None)
-                    except Exception:  # noqa: BLE001 - 补拉失败就按空数据处理
-                        pass
+                        download(req, output)
+                    except Exception as ex:  # noqa: BLE001 - 补拉失败就按空数据处理
+                        output(f"补拉 {vt_symbol} 失败：{ex}")
                     else:
                         data = self.datafeed.query_bar_history(req, output)
 
@@ -687,6 +691,12 @@ class ManagerEngine(BaseEngine):
                 ov = overview_map.get((symbol, exchange))
                 if ov and ov.end and ov.end >= end:
                     skipped += 1
+                    if total == 1:
+                        # 单标的（比如选一只指数）要能看出"是跳过还是没数据"
+                        output(
+                            f"跳过 {vt_symbol}：库里已有数据覆盖到 "
+                            f"{ov.end:%Y-%m-%d %H:%M}，晚于本次结束时间"
+                        )
                     self._emit_progress(DownloadProgress(
                         task_id=task_id, phase="跳过已覆盖", total_symbols=total,
                         completed_symbols=success, failed_symbols=failed,
@@ -707,6 +717,13 @@ class ManagerEngine(BaseEngine):
             chunks: list[tuple[datetime, datetime]] = split_download_range(
                 dl_start, end, MINUTE_CHUNK_DAYS if interval == Interval.MINUTE else 0
             )
+            if total == 1:
+                # 单标的下载把请求参数打出来：区间/段数/模式一目了然
+                output(
+                    f"下载 {vt_symbol} {interval.value}："
+                    f"{dl_start:%Y-%m-%d %H:%M} ~ {end:%Y-%m-%d %H:%M}，"
+                    f"{len(chunks)} 段，模式 {mode.value}"
+                )
             count_total: int = 0
             failure: str = ""
             symbol_start: float = perf_counter()

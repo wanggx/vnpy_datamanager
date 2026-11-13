@@ -521,8 +521,9 @@ def test_minute_download_splits_into_chunks(monkeypatch: pytest.MonkeyPatch) -> 
 def test_empty_chunk_triggers_download_then_requery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """区间没缓存时先让数据源补拉一次再查（指数常见）。"""
+    """显式打开 auto_download_on_empty 时：先补拉再查（默认关闭，见下一条测试）。"""
     engine = make_download_engine(monkeypatch, RecordingDatabase())
+    engine.auto_download_on_empty = True
     feed = RecordingFeed(empty_first=True)
     engine.datafeed = feed  # type: ignore[assignment]
 
@@ -535,3 +536,21 @@ def test_empty_chunk_triggers_download_then_requery(
     assert len(feed.requests) == 2
     assert len(feed.downloads) == 1
     assert feed.downloads[0] == feed.requests[0]
+
+def test_empty_result_does_not_block_when_autodownload_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认不自动补拉：空结果立刻返回 0，不把界面卡在桥侧的几分钟等待上。"""
+    engine = make_download_engine(monkeypatch, RecordingDatabase())
+    assert engine.auto_download_on_empty is False
+    feed = RecordingFeed(empty_first=True)
+    engine.datafeed = feed  # type: ignore[assignment]
+
+    count = engine.download_bar_data(
+        "000001", Exchange.SSE, Interval.DAILY,
+        datetime(2026, 1, 1), lambda msg: None, datetime(2026, 1, 12),
+    )
+
+    assert count == 0
+    assert len(feed.requests) == 1
+    assert feed.downloads == []
