@@ -516,17 +516,28 @@ class ManagerEngine(BaseEngine):
 
     @staticmethod
     def _parse_vt_symbol(code: str) -> tuple[str, Exchange]:
-        """把 xtquant 代码（如 600000.SH）解析为 (symbol, Exchange)。"""
-        if code.endswith(".SH"):
-            return code[:-3], Exchange.SSE
-        if code.endswith(".SZ"):
-            return code[:-3], Exchange.SZSE
-        if code.endswith(".BJ"):
-            return code[:-3], Exchange.BSE
+        """把代码解析为 ``(symbol, Exchange)``，兼容 xtquant 与 VeighNa 两种后缀。
+
+        ``600000.SH``（xtquant）与 ``600000.SSE``（VeighNa ``vt_symbol``）都要认，
+        否则「指定标的」按交易所下拉拼出来的 ``000001.SSE`` 会被当成裸代码，
+        交易所再按首位猜成 SZSE——上证指数就被下到深圳去了。
+        """
+        value: str = code.strip()
+        upper: str = value.upper()
+        for suffix, exchange in (
+            (".SSE", Exchange.SSE),
+            (".SH", Exchange.SSE),
+            (".SZSE", Exchange.SZSE),
+            (".SZ", Exchange.SZSE),
+            (".BSE", Exchange.BSE),
+            (".BJ", Exchange.BSE),
+        ):
+            if upper.endswith(suffix):
+                return value[: -len(suffix)], exchange
         # 兜底：无法识别交易所时按代码首位猜测（6/5开头沪市，0/3深市）
-        if code and code[0] == "6":
-            return code, Exchange.SSE
-        return code, Exchange.SZSE
+        if value and value[0] == "6":
+            return value, Exchange.SSE
+        return value, Exchange.SZSE
 
     def _emit_progress(self, progress: DownloadProgress) -> None:
         """发布批量下载进度事件。"""

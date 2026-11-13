@@ -369,3 +369,18 @@ def test_get_trading_dates_without_hook_returns_none(
     assert engine.get_trading_dates(
         datetime(2026, 10, 13, tzinfo=TZ), datetime(2026, 10, 16, tzinfo=TZ)
     ) is None
+
+def test_parse_vt_symbol_accepts_vnpy_and_xtquant_suffixes() -> None:
+    """「指定标的」按交易所下拉拼出的是 VeighNa 后缀（.SSE），必须能解析回正确交易所。
+
+    之前只认 .SH/.SZ/.BJ，``000001.SSE`` 会被当成裸代码、交易所再按首位猜成 SZSE，
+    上证指数就被下到深圳去了。
+    """
+    assert ManagerEngine._parse_vt_symbol("000001.SSE") == ("000001", Exchange.SSE)
+    assert ManagerEngine._parse_vt_symbol("000001.SZSE") == ("000001", Exchange.SZSE)
+    assert ManagerEngine._parse_vt_symbol("830799.BSE") == ("830799", Exchange.BSE)
+    assert ManagerEngine._parse_vt_symbol("000001.SH") == ("000001", Exchange.SSE)
+    assert ManagerEngine._parse_vt_symbol("399001.SZ") == ("399001", Exchange.SZSE)
+    # 裸代码仍按首位兜底
+    assert ManagerEngine._parse_vt_symbol("600000") == ("600000", Exchange.SSE)
+    assert ManagerEngine._parse_vt_symbol("000001") == ("000001", Exchange.SZSE)
