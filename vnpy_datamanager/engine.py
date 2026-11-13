@@ -1,7 +1,8 @@
 """历史数据的导入、导出、查询和下载。"""
 import csv
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from functools import partial
 from time import perf_counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -31,6 +32,39 @@ SYMBOL_TIMEOUT_SECONDS: float = 120.0
 PRIMARY_SECTOR: str = "沪深A股"
 FALLBACK_SECTORS: tuple[str, ...] = ()
 VALID_MARKETS: tuple[str, ...] = (".SH", ".SZ")
+
+# 分钟线单次请求的跨度上限（自然日）。整段拉一年 ≈ 6 万根，数据源 RPC 会长时间
+# 不返回、进度条一动不动；拆成小段后每段都能单独超时和上报进度。
+MINUTE_CHUNK_DAYS: int = 5
+
+
+def split_download_range(
+    start: datetime, end: datetime, chunk_days: int
+) -> list[tuple[datetime, datetime]]:
+    """把 ``[start, end]`` 按 ``chunk_days`` 自然日拆段；``chunk_days<=0`` 不拆。"""
+    if chunk_days <= 0 or end <= start:
+        return [(start, end)]
+    chunks: list[tuple[datetime, datetime]] = []
+    cursor: datetime = start
+    while cursor < end:
+        chunk_end: datetime = min(cursor + timedelta(days=chunk_days), end)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end
+    return chunks or [(start, end)]
+
+# 大盘指数：QMT 代码 → 名称。与 vnpy_marketsentiment.DEFAULT_INDEX_SYMBOLS 一致
+# （市场情绪的 IndexFactor 就吃这三只，重算要读它们的 1 分钟线与日线）。
+INDEX_SYMBOLS: dict[str, str] = {
+    "000001.SH": "上证综指",
+    "399001.SZ": "深证成指",
+    "399006.SZ": "创业板指",
+}
+# 同一批指数的 VeighNa 写法（交易所用 SSE/SZSE），用于列表里补名称。
+INDEX_VT_SYMBOLS: dict[str, str] = {
+    "000001.SSE": "上证综指",
+    "399001.SZSE": "深证成指",
+    "399006.SZSE": "创业板指",
+}
 
 
 class DownloadMode(Enum):
@@ -325,6 +359,18 @@ class ManagerEngine(BaseEngine):
         # Otherwise use datafeed to query data
         else:
             data = self.datafeed.query_bar_history(req, output)
+            if not data:
+                # 本地区间没缓存时数据源直接回空（指数、刚补进来的新标的都这样）。
+                # 先让它把这段拉进本地缓存再查一次；区间已按 MINUTE_CHUNK_DAYS 拆小，
+                # 这次补拉不会又变成一个大请求。
+                download = getattr(self.datafeed, "download_bar_history", None)
+                if callable(download):
+                    try:
+                        download(req, lambda msg: None)
+                    except Exception:  # noqa: BLE001 - 补拉失败就按空数据处理
+                        pass
+                    else:
+                        data = self.datafeed.query_bar_history(req, output)
 
         if data:
             self.database.save_bar_data(data)
@@ -656,37 +702,63 @@ class ManagerEngine(BaseEngine):
                 if ov and ov.end:
                     dl_start = ov.end
 
-            try:
-                symbol_start: float = perf_counter()
-                count: int = self._run_with_timeout(
-                    lambda: self.download_bar_data(
-                        symbol, exchange, interval, dl_start, output, end
-                    ),
-                    vt_symbol,
-                )
-                elapsed: float = perf_counter() - symbol_start
-                if elapsed >= 30:
-                    # 单标的拖慢会让进度条长时间不动，留一行日志便于事后定位
-                    output(
-                        f"下载 {vt_symbol} {interval.value} 耗时 {elapsed:.0f}s"
-                        "（数据源响应慢）"
+            # 分钟线整段请求会让数据源 RPC 长时间不回（一年 ≈ 6 万根，进度条一动不动），
+            # 按 5 天一段拆开：每段单独超时、单独发进度，界面能看出在往前走。
+            chunks: list[tuple[datetime, datetime]] = split_download_range(
+                dl_start, end, MINUTE_CHUNK_DAYS if interval == Interval.MINUTE else 0
+            )
+            count_total: int = 0
+            failure: str = ""
+            symbol_start: float = perf_counter()
+            for chunk_no, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+                if self._is_cancelled(task_id):
+                    break
+                try:
+                    count_total += self._run_with_timeout(
+                        partial(
+                            self.download_bar_data,
+                            symbol, exchange, interval, chunk_start, output, chunk_end,
+                        ),
+                        vt_symbol,
                     )
-                if count > 0:
-                    success += 1
-                else:
-                    # 空数据：数据源无该标的该区间数据，记为跳过而非失败
-                    skipped += 1
-            except TimeoutError as ex:
-                failed += 1
-                failed_symbols.append(vt_symbol)
+                except TimeoutError as ex:
+                    failure = (
+                        f"下载 {vt_symbol} {interval.value} 第 {chunk_no}/{len(chunks)} 段"
+                        f"超时：{ex}（已跳过该标的，可稍后重试）"
+                    )
+                    break
+                except Exception as ex:  # noqa: BLE001 - 单标的失败不阻断整批
+                    failure = (
+                        f"下载 {vt_symbol} {interval.value} 第 {chunk_no}/{len(chunks)} 段"
+                        f"失败：{ex}"
+                    )
+                    break
+                if len(chunks) > 1:
+                    self._emit_progress(DownloadProgress(
+                        task_id=task_id,
+                        phase=f"下载中 · 第 {chunk_no}/{len(chunks)} 段",
+                        total_symbols=total, completed_symbols=success,
+                        failed_symbols=failed, skipped_symbols=skipped,
+                        current_symbol=vt_symbol,
+                        status=DownloadTaskStatus.RUNNING,
+                    ))
+
+            elapsed: float = perf_counter() - symbol_start
+            if elapsed >= 30:
+                # 单标的拖慢会让进度条长时间不动，留一行日志便于事后定位
                 output(
-                    f"下载 {vt_symbol} {interval.value} 超时：{ex}"
-                    "（已跳过该标的，可稍后重试）"
+                    f"下载 {vt_symbol} {interval.value} 耗时 {elapsed:.0f}s"
+                    "（数据源响应慢）"
                 )
-            except Exception as ex:  # noqa: BLE001 - 单标的失败不阻断整批
+            if failure:
                 failed += 1
                 failed_symbols.append(vt_symbol)
-                output(f"下载 {vt_symbol} {interval.value} 失败：{ex}")
+                output(failure)
+            elif count_total > 0:
+                success += 1
+            else:
+                # 空数据：数据源无该标的该区间数据，记为跳过而非失败
+                skipped += 1
 
             self._emit_progress(DownloadProgress(
                 task_id=task_id, phase="下载中", total_symbols=total,

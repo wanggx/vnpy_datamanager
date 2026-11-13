@@ -18,7 +18,7 @@ from vnpy.trader.utility import available_timezones
 from ..engine import (
     APP_NAME, ManagerEngine, BarOverview, DataUniverse, DownloadMode,
     EVENT_DM_DOWNLOAD_PROGRESS, DownloadProgress, DownloadTaskStatus,
-    DownloadTaskResult,
+    DownloadTaskResult, INDEX_SYMBOLS, INDEX_VT_SYMBOLS,
 )
 from .browser_model import (
     BrowserRow, PAGE_SIZE, PREVIEW_ROWS, SORT_RECENT, SORT_SYMBOL,
@@ -36,13 +36,18 @@ INTERVAL_NAME_MAP: dict[Interval, str] = {
 class ManagerWidget(QtWidgets.QWidget):
     """数据管理主界面。"""
 
+    # 概览在后台线程读，结果经 Qt 信号回到主线程渲染（跨线程 emit 自动排队）
+    signal_overview_ready: QtCore.Signal = QtCore.Signal(object, str)
+
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         """取得数据管理引擎并初始化界面。"""
         super().__init__()
 
         self.engine: ManagerEngine = cast(ManagerEngine, main_engine.get_engine(APP_NAME))
+        self._refreshing_tree: bool = False
 
         self.init_ui()
+        self.signal_overview_ready.connect(self._on_overview_ready)
 
     def init_ui(self) -> None:
         """搭建数据树、K 线表和刷新、导入、更新、下载按钮。"""
@@ -51,13 +56,8 @@ class ManagerWidget(QtWidgets.QWidget):
         self.init_table()
 
         refresh_button: QtWidgets.QPushButton = QtWidgets.QPushButton("刷新")
-        refresh_button.clicked.connect(self.refresh_tree)
-
-        import_button: QtWidgets.QPushButton = QtWidgets.QPushButton("导入数据")
-        import_button.clicked.connect(self.import_data)
-
-        update_button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新数据")
-        update_button.clicked.connect(self.update_data)
+        refresh_button.clicked.connect(self.refresh_tree_async)
+        self.refresh_button: QtWidgets.QPushButton = refresh_button
 
         download_button: QtWidgets.QPushButton = QtWidgets.QPushButton("下载数据")
         download_button.clicked.connect(self.download_data)
@@ -71,8 +71,6 @@ class ManagerWidget(QtWidgets.QWidget):
         hbox1: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         hbox1.addWidget(refresh_button)
         hbox1.addStretch()
-        hbox1.addWidget(import_button)
-        hbox1.addWidget(update_button)
         hbox1.addWidget(download_button)
         hbox1.addWidget(quality_button)
         hbox1.addWidget(schedule_button)
@@ -194,14 +192,54 @@ class ManagerWidget(QtWidgets.QWidget):
         self._display_limit += PAGE_SIZE
         self._render_rows()
 
+    def refresh_tree_async(self) -> None:
+        """后台读概览后回主线程渲染：全库 GROUP BY 要扫千万行，不能占 GUI 线程。
+
+        打开界面与点「刷新」都走这里；结果按信号回主线程，界面在等待期间保持可交互。
+        """
+        if self._refreshing_tree:
+            return
+        self._refreshing_tree = True
+        button = getattr(self, "refresh_button", None)
+        if button is not None:
+            button.setEnabled(False)
+            button.setText("刷新中…")
+        threading.Thread(
+            target=self._load_overview, name="dm-overview", daemon=True
+        ).start()
+
+    def _load_overview(self) -> None:
+        """子线程：只做查询，不碰界面。"""
+        try:
+            overviews: list[BarOverview] = self.engine.get_bar_overview()
+            error: str = ""
+        except Exception as ex:  # noqa: BLE001 - 读失败也要恢复按钮状态
+            overviews = []
+            error = f"{type(ex).__name__}: {ex}"
+        self.signal_overview_ready.emit(overviews, error)
+
+    def _on_overview_ready(self, overviews: object, error: str) -> None:
+        """主线程槽：恢复按钮，渲染概览。"""
+        self._refreshing_tree = False
+        button = getattr(self, "refresh_button", None)
+        if button is not None:
+            button.setEnabled(True)
+            button.setText("刷新")
+        if error:
+            self.browser_info_label.setText(f"读取数据概览失败：{error}")
+            return
+        self._apply_overview(cast(list[BarOverview], overviews))
+
     def refresh_tree(self) -> None:
-        """重新读取数据库概览，刷新筛选下拉并回到第一页。
+        """同步刷新概览（脚本/测试用；界面请走 ``refresh_tree_async``）。"""
+        self._apply_overview(self.engine.get_bar_overview())
+
+    def _apply_overview(self, overviews: list[BarOverview]) -> None:
+        """把概览列表灌进浏览器：刷新筛选下拉并回到第一页。
 
         概览是一次全量查询（5000+ 行，毫秒级），真正的开销在渲染，所以这里只缓存
         数据、只渲染 ``PAGE_SIZE`` 行。
         """
-        overviews: list[BarOverview] = self.engine.get_bar_overview()
-
         rows: list[BrowserRow] = []
         totals: dict[Interval, int] = {}
         exchanges: set[Exchange] = set()
@@ -213,6 +251,7 @@ class ManagerWidget(QtWidgets.QWidget):
 
             totals[interval] = totals.get(interval, 0) + 1
             exchanges.add(exchange)
+            vt_symbol: str = f"{overview.symbol}.{exchange.value}"
             rows.append(
                 BrowserRow(
                     symbol=overview.symbol,
@@ -222,6 +261,7 @@ class ManagerWidget(QtWidgets.QWidget):
                     count=int(overview.count),
                     start=cast(datetime, overview.start),
                     end=cast(datetime, overview.end),
+                    is_index=vt_symbol in INDEX_VT_SYMBOLS,
                 )
             )
 
@@ -246,7 +286,11 @@ class ManagerWidget(QtWidgets.QWidget):
             self.exchange_combo.blockSignals(False)
 
     def _contract_name(self, symbol: str, exchange: Exchange) -> str:
-        """合约名称（来自主引擎合约缓存；取不到就留空，界面显示 ``-``）。"""
+        """合约名称（来自主引擎合约缓存；取不到就留空，界面显示 ``-``）。
+
+        指数不在网关合约表里，网关查不到名称时用内置的大盘指数名补上，
+        这样列表里 ``000001.SSE`` 显示的是「上证综指」而不是 ``-``。
+        """
         vt_symbol: str = f"{symbol}.{exchange.value}"
         if vt_symbol in self._name_cache:
             return self._name_cache[vt_symbol]
@@ -257,6 +301,7 @@ class ManagerWidget(QtWidgets.QWidget):
             name = getattr(contract, "name", "") or ""
         except Exception:  # noqa: BLE001 - 名称只是展示，取不到不影响浏览
             name = ""
+        name = name or INDEX_VT_SYMBOLS.get(vt_symbol, "")
         self._name_cache[vt_symbol] = name
         return name
 
@@ -599,8 +644,10 @@ class ManagerWidget(QtWidgets.QWidget):
         dialog.exec_()
 
     def show(self) -> None:
-        """最大化显示窗口。"""
+        """最大化显示窗口，并自动刷新一次概览（后台线程，不卡界面）。"""
         self.showMaximized()
+        # 先让窗口画出来，再排队刷新：QTimer.singleShot 保证首帧不被查询占住
+        QtCore.QTimer.singleShot(0, self.refresh_tree_async)
 
     def output(self, msg: str) -> None:
         """输出下载过程中的日志"""
@@ -757,16 +804,17 @@ class ImportDialog(QtWidgets.QDialog):
 
 
 class DownloadDialog(QtWidgets.QDialog):
-    """批量下载历史数据的对话框（对应阶段一原型 stage1-datamanager-vnpy-v3）。
+    """批量下载历史数据的对话框。
 
-    面向数据集合/股票池批量下载，不要求用户逐个输入标的。保留原单标的下载
-    能力：数据集合选"指定标的"时显示代码输入框。
+    三个数据集合，切换时下方显示对应输入：
+
+    - 沪深全市场：全部沪深 A 股（xtdata 的「沪深A股」板块）；
+    - 大盘指数：指数代码列表，默认就是市场情绪用的三只；
+    - 指定标的：单只标的（代码 + 交易所）。
     """
 
     # 数据集合选项
-    UNIVERSE_OPTIONS: list[str] = ["沪深全市场", "指数成分", "自选股票池", "指定标的"]
-    # 标的范围
-    SCOPE_OPTIONS: list[str] = ["全部标的", "失败标的", "缺口标的"]
+    UNIVERSE_OPTIONS: list[str] = ["沪深全市场", "大盘指数", "指定标的"]
     # 下载模式
     MODE_OPTIONS: list[str] = ["追加", "补缺口", "重下"]
     # 进度事件经 Qt 信号跨线程投递回 GUI 主线程（事件引擎线程 emit → 主线程槽）
@@ -779,24 +827,40 @@ class DownloadDialog(QtWidgets.QDialog):
         self.engine: ManagerEngine = engine
 
         self.setWindowTitle("批量下载历史数据")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(640)
 
         # 数据集合
         self.universe_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.universe_combo.addItems(self.UNIVERSE_OPTIONS)
         self.universe_combo.currentTextChanged.connect(self._on_universe_changed)
 
+        # 指数（仅"大盘指数"时显示）：单选下拉，显示「代码 + 名称」
+        self.index_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for code, name in INDEX_SYMBOLS.items():
+            self.index_combo.addItem(f"{code}  {name}", code)
+        self.index_combo.setVisible(False)
+        self.index_hint_label: QtWidgets.QLabel = QtWidgets.QLabel(
+            "一次下一只；重算要读指数的 1 分钟线与日线，两只周期各下一次。"
+        )
+        self.index_hint_label.setWordWrap(True)
+        self.index_hint_label.setStyleSheet("color:#64707d;")
+        self.index_hint_label.setVisible(False)
+
         # 单标的输入（仅"指定标的"时显示）
         self.symbol_edit: QtWidgets.QLineEdit = QtWidgets.QLineEdit()
+        self.symbol_edit.setPlaceholderText("标的代码，如 000001 / 600000")
         self.exchange_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         for exchange in Exchange:
             self.exchange_combo.addItem(str(exchange.name), exchange)
         self.symbol_edit.setVisible(False)
         self.exchange_combo.setVisible(False)
 
-        # 标的范围
-        self.scope_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        self.scope_combo.addItems(self.SCOPE_OPTIONS)
+        # 这几行的标签要跟着字段一起显隐（addRow(str, w) 不会自动隐藏标签）
+        self.index_label: QtWidgets.QLabel = QtWidgets.QLabel("指数")
+        self.symbol_label: QtWidgets.QLabel = QtWidgets.QLabel("代码")
+        self.exchange_label: QtWidgets.QLabel = QtWidgets.QLabel("交易所")
+        for label in (self.index_label, self.symbol_label, self.exchange_label):
+            label.setVisible(False)
 
         # 周期（按用户决策：只保留 1m 与日线）
         self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
@@ -841,9 +905,10 @@ class DownloadDialog(QtWidgets.QDialog):
         # 布局
         form: QtWidgets.QFormLayout = QtWidgets.QFormLayout()
         form.addRow("数据集合", self.universe_combo)
-        form.addRow("代码", self.symbol_edit)
-        form.addRow("交易所", self.exchange_combo)
-        form.addRow("标的范围", self.scope_combo)
+        form.addRow(self.index_label, self.index_combo)
+        form.addRow(self.index_hint_label)
+        form.addRow(self.symbol_label, self.symbol_edit)
+        form.addRow(self.exchange_label, self.exchange_combo)
         form.addRow("周期", self.interval_combo)
         form.addRow("下载模式", self.mode_combo)
         form.addRow("开始日期", self.start_date_edit)
@@ -861,25 +926,48 @@ class DownloadDialog(QtWidgets.QDialog):
         self.setLayout(form)
 
     def _on_universe_changed(self, text: str) -> None:
-        """数据集合切换：仅"指定标的"显示代码/交易所输入。"""
-        is_single: bool = (text == "指定标的")
+        """数据集合切换：只显示当前集合需要的输入框（标签一起显隐）。"""
+        is_index: bool = text == "大盘指数"
+        is_single: bool = text == "指定标的"
+        self.index_label.setVisible(is_index)
+        self.index_combo.setVisible(is_index)
+        self.index_hint_label.setVisible(is_index)
+        self.symbol_label.setVisible(is_single)
         self.symbol_edit.setVisible(is_single)
+        self.exchange_label.setVisible(is_single)
         self.exchange_combo.setVisible(is_single)
+
+    def selected_index(self) -> str:
+        """下拉里选中的指数 QMT 代码（如 ``000001.SH``）。"""
+        return str(self.index_combo.currentData() or "")
 
     def _build_universe(self) -> DataUniverse:
         """根据当前选择构造 DataUniverse。"""
         name: str = self.universe_combo.currentText()
+        if name == "大盘指数":
+            index: str = self.selected_index()
+            return DataUniverse(
+                name=name, symbols=[index] if index else [], source="index"
+            )
         if name == "指定标的":
+            code: str = self.symbol_edit.text().strip()
+            exchange: Exchange = self.exchange_combo.currentData()
             return DataUniverse(
                 name=name,
-                symbols=[f"{self.symbol_edit.text()}.{self.exchange_combo.currentData().value}"],
+                symbols=[f"{code}.{exchange.value}"] if code else [],
                 source="manual",
             )
         return DataUniverse(name=name, source="xtquant")
 
     def _query_coverage(self) -> None:
-        """查询股票池标的数量与已有覆盖率。"""
+        """查询标的数量与已有覆盖率（三类数据集合都支持）。"""
         universe: DataUniverse = self._build_universe()
+        if universe.source == "manual" and not universe.symbols:
+            self.info_label.setText("请填写标的代码。")
+            return
+        if universe.source == "index" and not universe.symbols:
+            self.info_label.setText("请选择一个指数。")
+            return
         if universe.source == "manual":
             self.info_label.setText("指定标的模式：单标的下载。")
             return
@@ -897,6 +985,11 @@ class DownloadDialog(QtWidgets.QDialog):
             and (ov.symbol, ov.exchange) in set(symbols)
         )
         ratio: float = covered / total * 100 if total else 0
+        if universe.source == "index":
+            self.info_label.setText(
+                f"指数标的数：{total}，已有覆盖率：{ratio:.1f}%（{interval.value} 周期）。"
+            )
+            return
         self.info_label.setText(
             f"股票池标的数：{total}，已有覆盖率：{ratio:.1f}%，"
             f"将由数据源自动分批下载，用户不需要逐个输入或点击标的。"
@@ -911,6 +1004,12 @@ class DownloadDialog(QtWidgets.QDialog):
         模态进度对话框上等待，不阻塞 Qt 事件循环，界面不卡。
         """
         universe: DataUniverse = self._build_universe()
+        if universe.source == "index" and not universe.symbols:
+            QtWidgets.QMessageBox.warning(self, "下载历史数据", "请选择一个指数。")
+            return
+        if universe.source == "manual" and not universe.symbols:
+            QtWidgets.QMessageBox.warning(self, "下载历史数据", "请填写标的代码。")
+            return
         interval: Interval = Interval(self.interval_combo.currentData())
         mode_map: dict = {
             "追加": DownloadMode.APPEND,

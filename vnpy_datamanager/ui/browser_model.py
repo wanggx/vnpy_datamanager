@@ -46,6 +46,7 @@ class BrowserRow:
     count: int
     start: datetime
     end: datetime
+    is_index: bool = False   # 大盘指数：列表里置顶显示，方便确认指数是否已下载
 
     @property
     def vt_symbol(self) -> str:
@@ -94,7 +95,7 @@ def filter_rows(
     """按周期（单选）/交易所/关键字过滤并排序，返回**完整匹配集**。
 
     截断交给调用方（界面按 ``display_limit`` 只渲染前 N 行）；这样「搜索跨全库」
-    与「只显示 N 行」互不干扰。
+    与「只显示 N 行」互不干扰。大盘指数（``is_index``）无论哪种排序都置顶。
     """
     key: str = normalize_keyword(keyword)
 
@@ -110,8 +111,22 @@ def filter_rows(
         scored.append((score, row))
 
     if sort == SORT_SYMBOL:
-        scored.sort(key=lambda item: (item[0], item[1].symbol, item[1].exchange.value))
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                0 if item[1].is_index else 1,
+                item[1].symbol,
+                item[1].exchange.value,
+            )
+        )
     else:   # 最近更新优先
-        scored.sort(key=lambda item: (item[0], -item[1].end.timestamp(), item[1].symbol))
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                0 if item[1].is_index else 1,
+                -item[1].end.timestamp(),
+                item[1].symbol,
+            )
+        )
 
     return [row for _, row in scored]

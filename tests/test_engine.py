@@ -50,6 +50,23 @@ class RecordingDatabase:
         matched.sort(key=lambda bar: bar.datetime)
         return matched
 
+    def get_bar_overview(self) -> list:
+        """下载路径（APPEND）会先查覆盖范围，这里给空表示库里没有。"""
+        return []
+
+    def delete_bar_data(
+        self, symbol: str, exchange: Exchange, interval: Interval
+    ) -> int:
+        removed: list[BarData] = [
+            bar
+            for bar in self.stored
+            if bar.symbol == symbol
+            and bar.exchange == exchange
+            and bar.interval == interval
+        ]
+        self.stored = [bar for bar in self.stored if bar not in removed]
+        return len(removed)
+
 
 def make_engine(
     monkeypatch: pytest.MonkeyPatch,
@@ -64,6 +81,34 @@ def make_engine(
     monkeypatch.setattr("vnpy_datamanager.engine.get_database", get_database)
     monkeypatch.setattr("vnpy_datamanager.engine.get_datafeed", get_datafeed)
     return ManagerEngine(object(), object())  # type: ignore[arg-type]
+
+
+def make_download_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    database: "RecordingDatabase",
+) -> ManagerEngine:
+    """下载路径用的引擎：主引擎/事件引擎都要能应答（取合约、发进度）。"""
+    monkeypatch.setattr(
+        "vnpy_datamanager.engine.get_database", lambda: database
+    )
+    monkeypatch.setattr(
+        "vnpy_datamanager.engine.get_datafeed", lambda: object()
+    )
+
+    class Stub:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        def get_contract(self, vt_symbol: str) -> None:
+            return None
+
+        def put(self, event: object) -> None:
+            self.events.append(event)
+
+    stub = Stub()
+    engine: ManagerEngine = ManagerEngine(stub, stub)  # type: ignore[arg-type]
+    engine.test_events = stub.events  # 测试用：记录进度事件
+    return engine
 
 
 def make_bar(
@@ -384,3 +429,109 @@ def test_parse_vt_symbol_accepts_vnpy_and_xtquant_suffixes() -> None:
     # 裸代码仍按首位兜底
     assert ManagerEngine._parse_vt_symbol("600000") == ("600000", Exchange.SSE)
     assert ManagerEngine._parse_vt_symbol("000001") == ("000001", Exchange.SZSE)
+
+def test_split_download_range_chunks_by_days() -> None:
+    """分钟线按天拆段：一年拆成多段，最后一段截到 end。"""
+    from vnpy_datamanager.engine import split_download_range
+
+    start = datetime(2026, 1, 1)
+    end = datetime(2026, 1, 12)
+    chunks = split_download_range(start, end, 5)
+    assert chunks == [
+        (datetime(2026, 1, 1), datetime(2026, 1, 6)),
+        (datetime(2026, 1, 6), datetime(2026, 1, 11)),
+        (datetime(2026, 1, 11), datetime(2026, 1, 12)),
+    ]
+    # 不拆 / 空区间
+    assert split_download_range(start, end, 0) == [(start, end)]
+    assert split_download_range(end, start, 5) == [(end, start)]
+
+
+class RecordingFeed:
+    """记录每次 query 的区间；返回固定的一根 bar。"""
+
+    def __init__(self, empty_first: bool = False) -> None:
+        self.requests: list[tuple[datetime, datetime]] = []
+        self.downloads: list[tuple[datetime, datetime]] = []
+        self.empty_first = empty_first
+
+    def query_bar_history(self, req, output=print):
+        self.requests.append((req.start, req.end))
+        if self.empty_first and len(self.requests) % 2 == 1:
+            return []
+        return [
+            BarData(
+                gateway_name="TEST",
+                symbol=req.symbol,
+                exchange=req.exchange,
+                datetime=req.start,
+                interval=req.interval,
+                open_price=1.0,
+                high_price=1.0,
+                low_price=1.0,
+                close_price=1.0,
+                volume=1.0,
+                turnover=1.0,
+            )
+        ]
+
+    def download_bar_history(self, req, output=print):
+        self.downloads.append((req.start, req.end))
+        return True
+
+
+def test_minute_download_splits_into_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """分钟线按 5 天一段请求，进度里带「第 x/y 段」；日线不拆。"""
+    from vnpy_datamanager.engine import DataUniverse, DownloadMode
+
+    engine = make_download_engine(monkeypatch, RecordingDatabase())
+    feed = RecordingFeed()
+    engine.datafeed = feed  # type: ignore[assignment]
+    engine.symbol_timeout = 0
+
+    universe = DataUniverse(name="大盘指数", symbols=["000001.SSE"], source="index")
+    result = engine.download_universe_bar_data(
+        universe, Interval.MINUTE,
+        datetime(2026, 1, 1), datetime(2026, 1, 12),
+        lambda msg: None, mode=DownloadMode.APPEND,
+    )
+
+    assert result.success == 1, result
+    assert len(feed.requests) == 3, feed.requests
+    assert feed.requests[0] == (datetime(2026, 1, 1), datetime(2026, 1, 6))
+    assert feed.requests[-1] == (datetime(2026, 1, 11), datetime(2026, 1, 12))
+    # 进度事件里带段号，界面能看到「第 x/3 段」而不是一直 0%
+    phases = [
+        getattr(event.data, "phase", "")
+        for event in engine.test_events  # type: ignore[attr-defined]
+    ]
+    assert any("第 1/3 段" in phase for phase in phases), phases
+    assert any("第 3/3 段" in phase for phase in phases), phases
+
+    # 日线不拆段
+    feed.requests.clear()
+    engine.download_universe_bar_data(
+        universe, Interval.DAILY,
+        datetime(2026, 1, 1), datetime(2026, 1, 12),
+        lambda msg: None, mode=DownloadMode.APPEND,
+    )
+    assert len(feed.requests) == 1, feed.requests
+
+
+def test_empty_chunk_triggers_download_then_requery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """区间没缓存时先让数据源补拉一次再查（指数常见）。"""
+    engine = make_download_engine(monkeypatch, RecordingDatabase())
+    feed = RecordingFeed(empty_first=True)
+    engine.datafeed = feed  # type: ignore[assignment]
+
+    count = engine.download_bar_data(
+        "000001", Exchange.SSE, Interval.DAILY,
+        datetime(2026, 1, 1), lambda msg: None, datetime(2026, 1, 12),
+    )
+
+    assert count == 1
+    assert len(feed.requests) == 2
+    assert len(feed.downloads) == 1
+    assert feed.downloads[0] == feed.requests[0]
